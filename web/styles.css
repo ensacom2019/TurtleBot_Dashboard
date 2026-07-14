@@ -846,6 +846,53 @@ canvas {
   transform: translateY(0);
 }
 
+.notice-dialog {
+  width: min(560px, calc(100vw - 32px));
+  margin: auto;
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 20px 52px rgba(0, 0, 0, 0.52);
+  padding: 16px;
+}
+
+.notice-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.notice-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.notice-dialog h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.notice-dialog ul {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.notice-dialog code {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 @media (max-width: 1180px) {
   main {
     height: auto;

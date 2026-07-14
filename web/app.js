@@ -206,6 +206,10 @@ function bindElements() {
     "downloadRunLogsButton",
     "clearRunLogsButton",
     "runLogSummary",
+    "robotDiscoveryNotice",
+    "robotDiscoveryNoticeSummary",
+    "robotDiscoveryNoticeClose",
+    "robotDiscoveryNoticeCloseButton",
     "toast",
   ]) {
     els[id] = document.getElementById(id);
@@ -247,6 +251,11 @@ function bindActions() {
   els.clearRunLogsButton.addEventListener("click", clearRunLogs);
   els.refreshConnectionButton.addEventListener("click", refreshConnectionStatus);
   els.discoverRobotButton.addEventListener("click", discoverRobots);
+  els.robotDiscoveryNoticeClose.addEventListener("click", closeRobotDiscoveryNotice);
+  els.robotDiscoveryNoticeCloseButton.addEventListener("click", closeRobotDiscoveryNotice);
+  els.robotDiscoveryNotice.addEventListener("click", (event) => {
+    if (event.target === els.robotDiscoveryNotice) closeRobotDiscoveryNotice();
+  });
   els.activeRobotProfile.addEventListener("change", () => applyRobotProfile(els.activeRobotProfile.value));
   els.manualStopButton.addEventListener("click", () => stopManualDrive({ force: true }));
   els.cancelGoalButton.addEventListener("click", () => postJson("/api/cancel", {}).then(showResult));
@@ -719,11 +728,30 @@ async function discoverRobots() {
       });
     }
     renderDiscoveryResults(payload);
+    if (!addedProfiles.length) showRobotDiscoveryNotice(payload);
   } catch (error) {
     els.discoveryResults.innerHTML = `<div class="discovery-card"><p>${escapeHtml(error.message)}</p></div>`;
   } finally {
     els.discoverRobotButton.disabled = false;
   }
+}
+
+function showRobotDiscoveryNotice(payload) {
+  const candidates = payload.candidates || [];
+  const profiles = normalizedRobotProfiles(state.data?.setup || {});
+  const existing = candidates.filter((candidate) => profileIdForNamespace(candidate?.namespace, profiles));
+  if (existing.length) {
+    els.robotDiscoveryNoticeSummary.textContent = `ROS 후보 ${candidates.length}대 중 ${existing.length}대는 이미 로봇 탭에 등록되어 있습니다.`;
+  } else if (candidates.length) {
+    els.robotDiscoveryNoticeSummary.textContent = "ROS 후보는 보였지만 /scan, /odom, /cmd_vel 신호가 부족해 자동 등록하지 않았습니다.";
+  } else {
+    els.robotDiscoveryNoticeSummary.textContent = "현재 ROS 그래프에서 새 TurtleBot 후보를 찾지 못했습니다.";
+  }
+  if (!els.robotDiscoveryNotice.open) els.robotDiscoveryNotice.showModal();
+}
+
+function closeRobotDiscoveryNotice() {
+  if (els.robotDiscoveryNotice.open) els.robotDiscoveryNotice.close();
 }
 
 async function checkRobot() {

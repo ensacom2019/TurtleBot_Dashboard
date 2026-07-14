@@ -576,6 +576,23 @@
       </section>
     </main>
 
+    <dialog id="robotDiscoveryNotice" class="notice-dialog" aria-labelledby="robotDiscoveryNoticeTitle">
+      <div class="notice-dialog-head">
+        <h2 id="robotDiscoveryNoticeTitle">새 로봇 탭이 추가되지 않았습니다</h2>
+        <button id="robotDiscoveryNoticeClose" class="icon-button" type="button" aria-label="주의사항 닫기" title="닫기">&#215;</button>
+      </div>
+      <p id="robotDiscoveryNoticeSummary" class="soft-text"></p>
+      <ul>
+        <li>모든 장비의 <code>ROS_DOMAIN_ID</code>가 같고 <code>ROS_LOCALHOST_ONLY=0</code>인지 확인하세요.</li>
+        <li>같은 Wi-Fi 또는 유선망에 연결하고, 공유기의 클라이언트 격리와 PC 방화벽의 DDS 멀티캐스트 차단을 해제하세요.</li>
+        <li>각 로봇에서 base bringup을 실행한 뒤 <code>/scan</code>, <code>/odom</code>, <code>/cmd_vel</code> 중 하나 이상이 발행되는지 확인하세요.</li>
+        <li>토픽이 루트(<code>/scan</code>)인지 네임스페이스(<code>/tb3_3/scan</code>)인지 확인하세요.</li>
+        <li>SSH 응답 장비는 로봇으로 단정하지 않습니다. ROS 토픽이 확인돼야 새 탭으로 등록됩니다.</li>
+      </ul>
+      <div class="dialog-actions">
+        <button id="robotDiscoveryNoticeCloseButton" class="primary" type="button">확인</button>
+      </div>
+    </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/app.js"></script>
   </body>
