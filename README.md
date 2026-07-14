@@ -27,7 +27,7 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 - Nav2 사용 가능 시 Nav2 실행, 불가능 시 LiDAR A* 직접 추종 사용
 - LiDAR 점 표시와 본체 외곽 거리 기반 감속/회피
 - 카메라 화면, 수동 주행, 주행 로그, 진단 보고서
-- ROS 2 토픽 설정, 로봇 검색, 로봇 체크
+- ROS 2 토픽 설정, 로봇 탭 선택, 같은 사설 네트워크의 SSH 장비 및 ROS 로봇 검색, 로봇 체크
 - SSH 브링업: OpenCR 포트 검증 후 TurtleBot base, Nav2/AMCL, 카메라 실행
 - SSH 브링업 종료: 정지 명령 전송 후 대시보드가 시작한 base/Nav2/camera 프로세스 종료
 

@@ -256,10 +256,13 @@
 
             <h2>ROS2</h2>
             <div class="profile-strip">
-              <label>
-                Active Robot
-                <select id="activeRobotProfile"></select>
-              </label>
+              <div class="profile-controls">
+                <label>
+                  Active Robot
+                  <select id="activeRobotProfile"></select>
+                </label>
+                <button id="discoverRobotButton" class="icon-button" type="button" title="같은 네트워크에서 ROS 로봇 검색" aria-label="같은 네트워크에서 ROS 로봇 검색">&#128269;</button>
+              </div>
               <div id="robotProfileButtons" class="robot-profile-buttons"></div>
             </div>
             <div class="form-grid topics">
@@ -342,7 +345,6 @@
                   <button id="robotBringupStopButton" type="button" class="danger">브링업 종료</button>
                   <button id="robotCheckButton" type="button">로봇 체크</button>
                   <button id="copyDiagnosticsButton" type="button">진단 복사</button>
-                  <button id="discoverRobotButton" type="button">로봇 검색</button>
                   <button id="refreshConnectionButton" type="button">새로고침</button>
                 </div>
               </div>

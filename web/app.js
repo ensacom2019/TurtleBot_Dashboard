@@ -37,15 +37,15 @@ const state = {
 };
 
 const DEFAULT_ROBOT_PROFILES = {
-  tb3_1: {
-    label: "TurtleBot 1",
-    namespace: "/tb3_1",
-    topics: topicsForNamespace("/tb3_1", "color"),
-  },
   tb3_2: {
     label: "TurtleBot 2",
     namespace: "/",
     topics: topicsForNamespace("/", "camera_ros"),
+  },
+  tb3_1: {
+    label: "TurtleBot 1",
+    namespace: "/tb3_1",
+    topics: topicsForNamespace("/tb3_1", "color"),
   },
 };
 
@@ -707,13 +707,22 @@ async function toggleCamera() {
 }
 
 async function discoverRobots() {
-  els.discoveryResults.innerHTML = `<div class="discovery-card"><p>검색 중...</p></div>`;
+  els.discoverRobotButton.disabled = true;
+  els.discoveryResults.innerHTML = `<div class="discovery-card"><p>ROS 그래프와 같은 네트워크의 SSH 장비를 검색 중...</p></div>`;
   try {
     const payload = await fetchJson("/api/discover");
     fillConnectionStatus(payload);
+    const addedProfiles = addDiscoveredRobotProfiles(payload.candidates || []);
+    if (addedProfiles.length) {
+      await saveSetup({
+        successMessage: `${addedProfiles.join(", ")} 로봇 탭을 추가했습니다.`,
+      });
+    }
     renderDiscoveryResults(payload);
   } catch (error) {
     els.discoveryResults.innerHTML = `<div class="discovery-card"><p>${escapeHtml(error.message)}</p></div>`;
+  } finally {
+    els.discoverRobotButton.disabled = false;
   }
 }
 
@@ -1039,13 +1048,31 @@ function renderDiscoveryResults(payload) {
   const candidates = payload.candidates || [];
   const topicCount = payload.topics?.length || 0;
   const nodeCount = payload.nodes?.length || 0;
+  const networkDiscovery = payload.networkDiscovery || {};
+  const networkHosts = networkDiscovery.hosts || [];
+  const networkSummary = networkDiscovery.subnet
+    ? `${networkDiscovery.subnet} · SSH 응답 ${networkHosts.length}대`
+    : networkDiscovery.message || "네트워크 대역을 확인하지 못했습니다.";
+  const networkDetail = networkHosts.length
+    ? networkHosts
+      .map((host) => `${host.ip}${host.configured ? " (현재 설정)" : ""}`)
+      .join(", ")
+    : "SSH 응답 장비 없음";
+  const networkCard = `
+    <div class="discovery-card">
+      <strong>네트워크 장비</strong>
+      <p>${escapeHtml(networkSummary)}</p>
+      <p>${escapeHtml(networkDetail)}</p>
+      <p>SSH 응답만으로는 로봇을 추가하지 않습니다. ROS 토픽이 확인된 장비만 로봇 탭으로 등록됩니다.</p>
+    </div>
+  `;
   if (candidates.length === 0) {
     els.discoveryResults.innerHTML = `
       <div class="discovery-card">
         <strong>후보 없음</strong>
         <p>${escapeHtml(payload.message || "TurtleBot 후보를 찾지 못했습니다.")}</p>
         <p>nodes ${nodeCount} · topics ${topicCount}</p>
-      </div>
+      </div>${networkCard}
     `;
     return;
   }
@@ -1062,17 +1089,46 @@ function renderDiscoveryResults(payload) {
           <p>${escapeHtml(checks)}</p>
           <p>topics: ${escapeHtml(topics)}</p>
           <p>missing: ${escapeHtml(missing)}</p>
-          <button type="button" data-apply-candidate="${index}">토픽 반영</button>
+          <button type="button" data-apply-candidate="${index}">이 로봇 선택</button>
         </div>
       `;
     })
-    .join("");
+    .join("") + networkCard;
   els.discoveryResults.querySelectorAll("[data-apply-candidate]").forEach((button) => {
     button.addEventListener("click", async () => {
       const candidate = candidates[Number(button.dataset.applyCandidate)];
       await applyDiscoveredCandidate(candidate);
     });
   });
+}
+
+function addDiscoveredRobotProfiles(candidates) {
+  if (!state.data?.setup) return [];
+  const profiles = normalizedRobotProfiles(state.data.setup);
+  const added = [];
+  for (const candidate of candidates) {
+    const namespace = String(candidate?.namespace || "/").replace(/\/$/, "") || "/";
+    const checks = candidate?.checks || {};
+    const hasRobotSignals = Boolean(checks.scan || checks.odom || checks.cmdVel);
+    if (!hasRobotSignals || profileIdForNamespace(namespace, profiles)) continue;
+    const profileId = profileIdForDiscoveredNamespace(namespace, profiles);
+    const robotNumber = profileId.match(/^tb3_(\d+)$/)?.[1];
+    profiles[profileId] = {
+      label: robotNumber ? `TurtleBot ${robotNumber}` : `TurtleBot ${namespace.replace(/^\//, "")}`,
+      namespace,
+      topics: {
+        ...topicsForNamespace(namespace, "color"),
+        ...(candidate.recommendedTopics || {}),
+      },
+    };
+    added.push(profiles[profileId].label);
+  }
+  if (added.length) {
+    state.data.setup.robotProfiles = profiles;
+    renderRobotProfileControls({ ...state.data.setup, robotProfiles: profiles });
+    markSetupDirty();
+  }
+  return added;
 }
 
 async function applyDiscoveredCandidate(candidate) {
@@ -1100,19 +1156,25 @@ async function applyDiscoveredCandidate(candidate) {
   } catch (error) {
     toast(error.message);
   }
-  return;
-  toast("검색된 토픽을 반영했습니다.");
 }
 
-function profileIdForNamespace(namespace) {
+function profileIdForNamespace(namespace, profiles = normalizedRobotProfiles(state.data?.setup || {})) {
   const normalizedNamespace = String(namespace || "/").replace(/\/$/, "") || "/";
-  const profiles = normalizedRobotProfiles(state.data?.setup || {});
   for (const [id, profile] of Object.entries(profiles)) {
     const profileNamespace = String(profile.namespace || `/${id}`).replace(/\/$/, "") || "/";
     if (profileNamespace === normalizedNamespace) return id;
   }
-  const namespaceId = normalizedNamespace.replace(/^\//, "");
-  return profiles[namespaceId] ? namespaceId : "";
+  return "";
+}
+
+function profileIdForDiscoveredNamespace(namespace, profiles) {
+  const stem = String(namespace || "")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "_") || "robot";
+  if (!profiles[stem]) return stem;
+  let index = 2;
+  while (profiles[`${stem}_${index}`]) index += 1;
+  return `${stem}_${index}`;
 }
 
 function renderRobotProfileControls(setup) {

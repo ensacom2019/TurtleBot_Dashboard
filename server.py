@@ -35,7 +35,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-14.51"
+APP_VERSION = "2026-07-14.52"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -88,15 +88,15 @@ def topics_for_namespace(namespace: str, camera_style: str = "color") -> Dict[st
 
 
 DEFAULT_ROBOT_PROFILES = {
-    "tb3_1": {
-        "label": "TurtleBot 1",
-        "namespace": "/tb3_1",
-        "topics": topics_for_namespace("/tb3_1", "color"),
-    },
     "tb3_2": {
         "label": "TurtleBot 2",
         "namespace": "/",
         "topics": topics_for_namespace("/", "camera_ros"),
+    },
+    "tb3_1": {
+        "label": "TurtleBot 1",
+        "namespace": "/tb3_1",
+        "topics": topics_for_namespace("/tb3_1", "color"),
     },
 }
 
@@ -902,6 +902,58 @@ def detect_server_ip(robot_ip: str = "") -> str:
     except Exception:
         pass
     return select_server_ip(target, local_ip_addresses(), routed_ip)
+
+
+def same_subnet_hosts(address: str) -> tuple[Optional[ipaddress.IPv4Network], list[str]]:
+    """Return a bounded private /24 scan range without including the local host."""
+    try:
+        source = ipaddress.ip_address(str(address).strip())
+    except ValueError:
+        return None, []
+    if not isinstance(source, ipaddress.IPv4Address) or not source.is_private:
+        return None, []
+    subnet = ipaddress.ip_network(f"{source}/24", strict=False)
+    return subnet, [str(host) for host in subnet.hosts() if host != source]
+
+
+def discover_same_subnet_ssh_hosts(network: Dict[str, Any]) -> Dict[str, Any]:
+    """Probe SSH only on the dashboard's private /24; ROS confirms robot identity later."""
+    source = str(network.get("serverIp") or network.get("robotIp") or "").strip()
+    subnet, hosts = same_subnet_hosts(source)
+    if subnet is None:
+        return {
+            "ok": False,
+            "subnet": "",
+            "hosts": [],
+            "message": "A private server or robot IPv4 address is required for network discovery.",
+        }
+
+    configured_hosts = {
+        str(network.get("robotIp") or "").strip(),
+        str(network.get("robotSshHost") or "").strip(),
+    }
+
+    def ssh_open(host: str) -> Optional[str]:
+        try:
+            with socket.create_connection((host, 22), timeout=0.18):
+                return host
+        except OSError:
+            return None
+
+    open_hosts: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        for host in executor.map(ssh_open, hosts):
+            if host:
+                open_hosts.append(host)
+    return {
+        "ok": True,
+        "subnet": str(subnet),
+        "hosts": [
+            {"ip": host, "configured": host in configured_hosts}
+            for host in sorted(open_hosts, key=lambda item: tuple(int(part) for part in item.split(".")))
+        ],
+        "message": "SSH-reachable devices found. ROS topics are required before adding a TurtleBot profile.",
+    }
 
 
 def base_connection_info(
@@ -3068,6 +3120,7 @@ class NullRosBridge:
 
     def discover_robots(self) -> Dict[str, Any]:
         snapshot = self.state.snapshot()
+        network = snapshot["setup"].get("network", {})
         return {
             "ok": True,
             "mode": "offline-preview",
@@ -3076,7 +3129,8 @@ class NullRosBridge:
             "nodes": [],
             "candidates": [],
             "message": "ROS2 rclpy not available; discovery needs a ROS2-sourced shell.",
-            "network": public_network(snapshot["setup"].get("network", {})),
+            "network": public_network(network),
+            "networkDiscovery": discover_same_subnet_ssh_hosts(network),
         }
 
     def shutdown(self) -> None:
@@ -6099,6 +6153,8 @@ class RosBridge:
     def discover_robots(self) -> Dict[str, Any]:
         if self._is_fallback():
             return self._fallback.discover_robots()
+        setup = self.state.get_setup()
+        network = setup.get("network", {})
         topics_and_types = self.node.get_topic_names_and_types()
         nodes = sorted(set(self.node.get_node_names()))
         topic_names = sorted(name for name, _types in topics_and_types)
@@ -6121,6 +6177,8 @@ class RosBridge:
             "actions": actions,
             "candidates": candidates,
             "message": "Discovery complete." if candidates else "No TurtleBot-like ROS graph found.",
+            "network": public_network(network),
+            "networkDiscovery": discover_same_subnet_ssh_hosts(network),
         }
         self.state.update_runtime({"connection": result["connection"]})
         return result

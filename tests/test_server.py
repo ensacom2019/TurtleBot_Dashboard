@@ -77,6 +77,17 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertEqual(selected, "192.168.35.229")
 
+    def test_same_subnet_hosts_stays_within_private_24(self) -> None:
+        subnet, hosts = server.same_subnet_hosts("192.168.20.3")
+        self.assertEqual(str(subnet), "192.168.20.0/24")
+        self.assertEqual(len(hosts), 253)
+        self.assertNotIn("192.168.20.3", hosts)
+        self.assertIn("192.168.20.7", hosts)
+
+    def test_same_subnet_hosts_rejects_public_or_invalid_addresses(self) -> None:
+        self.assertEqual(server.same_subnet_hosts("8.8.8.8"), (None, []))
+        self.assertEqual(server.same_subnet_hosts("not-an-ip"), (None, []))
+
     def test_root_namespace_topics_have_one_leading_slash(self) -> None:
         topics = server.topics_for_namespace("/", "camera_ros")
         self.assertEqual(topics["cmdVel"], "/cmd_vel")
