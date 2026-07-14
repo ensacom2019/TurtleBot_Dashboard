@@ -12,6 +12,7 @@ data/maps/
 data/map-*
 run_logs/
 dashboard_server.log
+dashboard_server.err
 dashboard_server.err.log
 
 # Local Codex attachments and generated packages
