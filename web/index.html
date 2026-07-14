@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TurtleBot3 Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>TurtleBot3 Dashboard</h1>
+        <p id="connectionText">연결 대기</p>
+      </div>
+      <nav class="tabs" aria-label="대시보드 탭">
+        <button class="tab-button active" data-tab="setup">셋업</button>
+        <button class="tab-button" data-tab="drive">주행</button>
+        <button class="tab-button" data-tab="map-editor">맵 제작</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="setup" class="tab-panel active">
+        <div class="setup-grid">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>맵</h2>
+              <button id="saveSetupButton" class="primary">저장</button>
+            </div>
+            <div class="tool-strip" role="group" aria-label="셋업 조작">
+              <button type="button" class="tool-button active" data-setup-tool="pose">초기</button>
+              <button type="button" class="tool-button" data-setup-tool="robot">몸체</button>
+              <button type="button" class="tool-button" data-setup-tool="accessory">부속품</button>
+              <button type="button" class="tool-button" data-setup-tool="object">오브젝트</button>
+              <button type="button" class="tool-button" data-setup-tool="wall">벽</button>
+              <button type="button" class="tool-button" data-setup-tool="erase">지우기</button>
+            </div>
+            <div class="form-grid">
+              <label>
+                저장된 맵
+                <select id="mapSelect"></select>
+              </label>
+              <label>
+                해상도 m/px
+                <input id="mapResolution" type="number" step="0.001" min="0.001" />
+              </label>
+              <label>
+                원점 X
+                <input id="mapOriginX" type="number" step="0.01" />
+              </label>
+              <label>
+                원점 Y
+                <input id="mapOriginY" type="number" step="0.01" />
+              </label>
+              <label>
+                맵 방향 rad
+                <input id="mapOriginYaw" type="number" step="0.01" />
+              </label>
+              <label>
+                그리드 m
+                <input id="gridCellSize" type="number" step="0.005" min="0.005" />
+              </label>
+              <label class="range-field">
+                분홍 금지 반경 m
+                <span class="range-pair">
+                  <input id="plannerHardClearanceRange" type="range" step="0.01" min="0.05" max="0.40" />
+                  <input id="plannerHardClearance" type="number" step="0.01" min="0.05" max="0.40" />
+                </span>
+              </label>
+              <label class="check-row">
+                <input id="showGrid" type="checkbox" />
+                그리드 표시
+              </label>
+              <label class="check-row">
+                <input id="showInflation" type="checkbox" />
+                Inflation 표시
+              </label>
+              <label class="check-row">
+                <input id="showLidarPoints" type="checkbox" />
+                LiDAR 점 표시
+              </label>
+              <label class="check-row">
+                <input id="detectBlackWalls" type="checkbox" />
+                검은 벽 인식
+              </label>
+              <button id="clearGridButton" type="button">장애물 초기화</button>
+            </div>
+            <div class="map-shell setup-map-shell">
+              <canvas id="setupMapCanvas" width="900" height="620"></canvas>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>초기 위치</h2>
+              <button id="applyInitialPoseButton" class="primary">적용</button>
+            </div>
+            <div class="form-grid compact">
+              <label>
+                X m
+                <input id="initialX" type="number" step="0.01" />
+              </label>
+              <label>
+                Y m
+                <input id="initialY" type="number" step="0.01" />
+              </label>
+              <label>
+                방향 rad
+                <input id="initialYaw" type="number" step="0.01" />
+              </label>
+            </div>
+
+            <h2>몸체</h2>
+            <div class="form-grid compact">
+              <label>
+                길이 m
+                <input id="robotLength" type="number" step="0.001" min="0.01" />
+              </label>
+              <label>
+                너비 m
+                <input id="robotWidth" type="number" step="0.001" min="0.01" />
+              </label>
+              <label>
+                반경 m
+                <input id="robotRadius" type="number" step="0.001" min="0.01" />
+              </label>
+            </div>
+
+            <h2>부속품</h2>
+            <div class="form-grid compact">
+              <label>
+                앞 돌출 m
+                <input id="accessoryFront" type="number" step="0.001" min="0" />
+              </label>
+              <label>
+                뒤 돌출 m
+                <input id="accessoryBack" type="number" step="0.001" min="0" />
+              </label>
+              <label>
+                왼쪽 돌출 m
+                <input id="accessoryLeft" type="number" step="0.001" min="0" />
+              </label>
+              <label>
+                오른쪽 돌출 m
+                <input id="accessoryRight" type="number" step="0.001" min="0" />
+              </label>
+              <label>
+                높이 m
+                <input id="accessoryHeight" type="number" step="0.001" min="0" />
+              </label>
+              <label>
+                안전 여유 m
+                <input id="safetyMargin" type="number" step="0.001" min="0" />
+              </label>
+            </div>
+
+            <div class="footprint-box">
+              <div class="footprint-head">
+                <h2>유효 Footprint</h2>
+                <button id="copyFootprintButton" type="button">복사</button>
+              </div>
+              <div class="metric-grid">
+                <span>앞 <strong id="effectiveFront">-</strong></span>
+                <span>뒤 <strong id="effectiveBack">-</strong></span>
+                <span>왼쪽 <strong id="effectiveLeft">-</strong></span>
+                <span>오른쪽 <strong id="effectiveRight">-</strong></span>
+                <span>길이 <strong id="effectiveLength">-</strong></span>
+                <span>너비 <strong id="effectiveWidth">-</strong></span>
+              </div>
+              <textarea id="nav2Footprint" readonly rows="3"></textarea>
+            </div>
+
+            <h2>오브젝트</h2>
+            <div class="form-grid compact">
+              <label>
+                기본 너비 m
+                <input id="objectWidth" type="number" step="0.01" min="0.01" />
+              </label>
+              <label>
+                기본 높이 m
+                <input id="objectHeight" type="number" step="0.01" min="0.01" />
+              </label>
+              <label>
+                장애물 추가 여유 m
+                <input id="objectInflation" type="number" step="0.01" min="0" />
+              </label>
+            </div>
+            <div class="preset-row" aria-label="오브젝트 크기 프리셋">
+              <button type="button" data-object-preset="object-1" data-width="0.13" data-height="0.13">
+                오브젝트 1 · 13x13cm
+              </button>
+              <button type="button" data-object-preset="object-2" data-width="0.13" data-height="0.10">
+                오브젝트 2 · 13x10cm
+              </button>
+            </div>
+            <div class="obstacle-box">
+              <div class="footprint-head">
+                <h2>장애물 목록</h2>
+                <button id="clearObstaclesButton" type="button">전체 삭제</button>
+              </div>
+              <div id="obstacleList" class="obstacle-list"></div>
+            </div>
+
+            <h2>LiDAR 비상주행</h2>
+            <div class="form-grid compact">
+              <label class="check-row">
+                <input id="fallbackEnabled" type="checkbox" />
+                자동 전환
+              </label>
+              <label>
+                기본 속도 m/s
+                <input id="fallbackMaxLinear" type="number" step="0.01" min="0.01" max="0.12" />
+              </label>
+              <label>
+                감속 속도 m/s
+                <input id="fallbackMinLinear" type="number" step="0.005" min="0.005" max="0.08" />
+              </label>
+              <label>
+                최대 회전 rad/s
+                <input id="fallbackMaxAngular" type="number" step="0.1" min="0.1" max="1.5" />
+              </label>
+              <label>
+                추종 거리 m
+                <input id="fallbackLookahead" type="number" step="0.01" min="0.05" max="0.35" />
+              </label>
+              <label class="range-field">
+                Inflation 폭 m
+                <span class="range-pair">
+                  <input id="fallbackSoftDistanceRange" type="range" step="0.01" min="0" max="0.4" />
+                  <input id="fallbackSoftDistance" type="number" step="0.01" min="0" max="0.4" />
+                </span>
+              </label>
+              <label>
+                LiDAR 정지 여유 m
+                <input id="fallbackHardMargin" type="number" step="0.01" min="0.01" max="0.15" />
+              </label>
+              <label class="range-field">
+                Scan 제한 s
+                <span class="range-pair">
+                  <input id="fallbackScanTimeoutRange" type="range" step="0.1" min="0.5" max="1" />
+                  <input id="fallbackScanTimeout" type="number" step="0.1" min="0.5" max="1" />
+                </span>
+              </label>
+              <label class="range-field">
+                Odom 제한 s
+                <span class="range-pair">
+                  <input id="fallbackOdomTimeoutRange" type="range" step="0.1" min="0.5" max="1" />
+                  <input id="fallbackOdomTimeout" type="number" step="0.1" min="0.5" max="1" />
+                </span>
+              </label>
+              <label>
+                충돌 예측 s
+                <input id="fallbackCollisionHorizon" type="number" step="0.1" min="0.4" max="3" />
+              </label>
+            </div>
+
+            <h2>ROS2</h2>
+            <div class="profile-strip">
+              <label>
+                Active Robot
+                <select id="activeRobotProfile"></select>
+              </label>
+              <div id="robotProfileButtons" class="robot-profile-buttons"></div>
+            </div>
+            <div class="form-grid topics">
+              <label>
+                Robot IP
+                <input id="robotIp" type="text" />
+              </label>
+              <label>
+                Server IP
+                <input id="serverIp" type="text" />
+              </label>
+              <label>
+                ROS_DOMAIN_ID
+                <input id="rosDomainId" type="text" />
+              </label>
+              <label>
+                ROS_LOCALHOST_ONLY
+                <input id="rosLocalhostOnly" type="text" />
+              </label>
+              <label>
+                Robot SSH Host
+                <input id="robotSshHost" type="text" />
+              </label>
+              <label>
+                Robot SSH User
+                <input id="robotSshUser" type="text" />
+              </label>
+              <label>
+                Robot SSH Password
+                <input id="robotSshPassword" type="password" autocomplete="off" />
+              </label>
+              <label>
+                Scan
+                <input id="topicScan" type="text" />
+              </label>
+              <label>
+                Pose
+                <input id="topicPose" type="text" />
+              </label>
+              <label>
+                Odom
+                <input id="topicOdom" type="text" />
+              </label>
+              <label>
+                Camera
+                <input id="topicCamera" type="text" />
+              </label>
+              <label>
+                Compressed
+                <input id="topicCompressedCamera" type="text" />
+              </label>
+              <label>
+                Initial
+                <input id="topicInitialPose" type="text" />
+              </label>
+              <label>
+                Nav2 Action
+                <input id="topicGoalAction" type="text" />
+              </label>
+              <label>
+                Route Action
+                <input id="topicRouteAction" type="text" />
+              </label>
+              <label>
+                Goal Topic
+                <input id="topicGoalTopic" type="text" />
+              </label>
+              <label>
+                Cmd Vel
+                <input id="topicCmdVel" type="text" />
+              </label>
+            </div>
+
+            <div class="connection-box">
+              <div class="footprint-head">
+                <h2>연결 상태</h2>
+                <div class="button-row">
+                  <button id="robotBringupButton" type="button" class="primary">로봇 브링업</button>
+                  <button id="robotSshDetailButton" type="button">SSH 상세점검</button>
+                  <button id="robotBringupStopButton" type="button" class="danger">브링업 종료</button>
+                  <button id="robotCheckButton" type="button">로봇 체크</button>
+                  <button id="copyDiagnosticsButton" type="button">진단 복사</button>
+                  <button id="discoverRobotButton" type="button">로봇 검색</button>
+                  <button id="refreshConnectionButton" type="button">새로고침</button>
+                </div>
+              </div>
+              <dl class="status-list compact-status">
+                <div>
+                  <dt>Domain</dt>
+                  <dd id="connDomain">-</dd>
+                </div>
+                <div>
+                  <dt>Localhost</dt>
+                  <dd id="connLocalhost">-</dd>
+                </div>
+                <div>
+                  <dt>Server IP</dt>
+                  <dd id="connServerIps">-</dd>
+                </div>
+                <div>
+                  <dt>Scan</dt>
+                  <dd id="connScan">-</dd>
+                </div>
+                <div>
+                  <dt>Pose</dt>
+                  <dd id="connPose">-</dd>
+                </div>
+                <div>
+                  <dt>Nav2</dt>
+                  <dd id="connNav2">-</dd>
+                </div>
+              </dl>
+              <div id="robotCheckResults" class="robot-check-results"></div>
+              <textarea id="diagnosticReport" class="diagnostic-report" readonly rows="8"></textarea>
+              <div id="discoveryResults" class="discovery-results"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="map-editor" class="tab-panel">
+        <div class="map-editor-grid">
+          <section class="panel map-editor-controls">
+            <div class="panel-head">
+              <h2>새 맵</h2>
+              <button id="mapEditorCreateButton" class="primary" type="button">그리드 생성</button>
+            </div>
+            <div class="editor-library-controls">
+              <label>
+                저장된 맵 불러오기
+                <select id="mapEditorLoadSelect"></select>
+              </label>
+              <button id="mapEditorLoadButton" class="primary" type="button">불러오기</button>
+              <button id="mapEditorDeleteButton" class="danger" type="button">맵 삭제</button>
+            </div>
+            <div class="form-grid compact">
+              <label>
+                맵 이름
+                <input id="mapEditorName" type="text" maxlength="80" value="새 맵" />
+              </label>
+              <label>
+                가로 cm
+                <input id="mapEditorWidth" type="number" min="10" max="2000" step="1" value="180" />
+              </label>
+              <label>
+                세로 cm
+                <input id="mapEditorHeight" type="number" min="10" max="2000" step="1" value="180" />
+              </label>
+              <label>
+                1픽셀당 cm
+                <input id="mapEditorCmPerPixel" type="number" min="0.1" max="100" step="0.1" value="1" />
+              </label>
+            </div>
+            <div class="tool-strip map-editor-tools" role="group" aria-label="맵 제작 도구">
+              <button id="mapEditorPenButton" class="tool-button active icon-tool" type="button" title="펜" aria-label="펜">&#9998;</button>
+              <button id="mapEditorEraserButton" class="tool-button icon-tool" type="button" title="지우개" aria-label="지우개">&#9003;</button>
+              <button id="mapEditorClearButton" class="tool-button icon-tool" type="button" title="전체 지우기" aria-label="전체 지우기">&#128465;</button>
+            </div>
+            <div class="editor-metrics">
+              <span id="mapEditorSize">-</span>
+              <span id="mapEditorStatus">그리드 생성 대기</span>
+            </div>
+            <button id="mapEditorSaveButton" class="primary wide" type="button">맵 저장</button>
+          </section>
+          <section class="panel map-editor-canvas-panel">
+            <div class="map-editor-shell">
+              <canvas id="mapEditorCanvas" width="900" height="620"></canvas>
+            </div>
+            <p class="map-editor-help">휠: 확대/축소 · Shift + 드래그: 화면 이동 · 펜/지우개 선택 후 클릭 또는 드래그: 벽 편집</p>
+          </section>
+        </div>
+      </section>
+
+      <section id="drive" class="tab-panel">
+        <div class="drive-grid">
+          <section class="panel camera-panel">
+            <div class="panel-head">
+              <h2>카메라</h2>
+              <div class="camera-tools">
+                <span id="cameraStamp" class="soft-text">-</span>
+                <button id="cameraToggleButton" type="button" class="secondary">카메라 끄기</button>
+              </div>
+            </div>
+            <img id="cameraFrame" alt="TurtleBot camera" />
+          </section>
+
+          <section class="panel map-panel">
+            <div class="panel-head">
+              <h2>맵</h2>
+              <div class="button-row">
+                <button id="cancelGoalButton">취소</button>
+                <button id="stopButton" class="danger">정지</button>
+              </div>
+            </div>
+            <div class="map-shell">
+              <canvas id="driveMapCanvas" width="1100" height="760"></canvas>
+            </div>
+          </section>
+
+          <aside class="panel status-panel">
+            <h2>수동 운전</h2>
+            <div class="form-grid compact manual-speed-grid">
+              <label>
+                선속도
+                <input id="manualLinearSpeed" type="number" step="0.01" min="0" max="0.22" value="0.08" />
+              </label>
+              <label>
+                각속도
+                <input id="manualAngularSpeed" type="number" step="0.1" min="0" max="2.84" value="0.7" />
+              </label>
+            </div>
+            <div class="drive-pad" aria-label="수동 운전">
+              <button class="drive-button drive-forward" data-drive-linear="1" data-drive-angular="0" aria-label="전진" title="전진">↑</button>
+              <button class="drive-button drive-left" data-drive-linear="0" data-drive-angular="1" aria-label="좌회전" title="좌회전">←</button>
+              <button id="manualStopButton" class="drive-button drive-stop stop" aria-label="정지" title="정지">■</button>
+              <button class="drive-button drive-right" data-drive-linear="0" data-drive-angular="-1" aria-label="우회전" title="우회전">→</button>
+              <button class="drive-button drive-backward" data-drive-linear="-1" data-drive-angular="0" aria-label="후진" title="후진">↓</button>
+            </div>
+
+            <h2>명령</h2>
+            <div class="form-grid compact">
+              <label>
+                목표 X m
+                <input id="goalX" type="number" step="0.01" />
+              </label>
+              <label>
+                목표 Y m
+                <input id="goalY" type="number" step="0.01" />
+              </label>
+              <label class="range-field">
+                최종 방향 rad
+                <span class="range-pair">
+                  <input id="goalYawRange" type="range" min="-3.1416" max="3.1416" step="0.0001" value="0" />
+                  <input id="goalYaw" type="number" min="-3.1416" max="3.1416" step="0.01" value="0" />
+                </span>
+              </label>
+            </div>
+            <div class="route-tools">
+              <button id="goalModeButton" class="active" type="button" aria-pressed="true">최종 목표</button>
+              <button id="waypointModeButton" type="button" aria-pressed="false">경유지 추가</button>
+              <button id="clearWaypointsButton" type="button">경유지 초기화</button>
+            </div>
+            <div id="waypointList" class="waypoint-list"></div>
+            <div class="repeat-route-controls">
+              <label class="check-row">
+                <input id="repeatRouteEnabled" type="checkbox" />
+                구간 자동 반복
+              </label>
+              <div class="repeat-route-grid">
+                <label>
+                  시작 번호
+                  <input id="repeatRouteStart" type="number" min="1" max="1" step="1" value="1" />
+                </label>
+                <label>
+                  종료 번호
+                  <input id="repeatRouteEnd" type="number" min="1" max="1" step="1" value="1" />
+                </label>
+                <label>
+                  휴식 초
+                  <input id="repeatRoutePause" type="number" min="0.5" max="3600" step="0.5" value="5" />
+                </label>
+              </div>
+              <p id="repeatRouteStatus" class="repeat-route-status">반복 꺼짐</p>
+            </div>
+            <label class="check-row drive-test-toggle">
+              <input id="forceLidarFallback" type="checkbox" checked />
+              A* 직접 주행 (Nav2 백업 사용 안 함)
+            </label>
+            <button id="sendGoalButton" class="primary wide">목표로 이동</button>
+
+            <h2>상태</h2>
+            <dl class="status-list">
+              <div>
+                <dt>모드</dt>
+                <dd id="statusMode">-</dd>
+              </div>
+              <div>
+                <dt>진행</dt>
+                <dd id="statusNav">-</dd>
+              </div>
+              <div>
+                <dt>메시지</dt>
+                <dd id="statusMessage">-</dd>
+              </div>
+              <div>
+                <dt>현재 위치</dt>
+                <dd id="statusPose">-</dd>
+              </div>
+              <div>
+                <dt>목표</dt>
+                <dd id="statusGoal">-</dd>
+              </div>
+              <div>
+                <dt>경로</dt>
+                <dd id="statusPath">-</dd>
+              </div>
+              <div>
+                <dt>LiDAR 안전</dt>
+                <dd id="statusSafety">-</dd>
+              </div>
+            </dl>
+
+            <h2>주행 로그</h2>
+            <div class="button-row run-log-tools">
+              <button id="copyRunLogsButton" type="button">로그 복사</button>
+              <button id="downloadRunLogsButton" type="button">파일 저장</button>
+              <button id="clearRunLogsButton" class="danger" type="button">초기화</button>
+            </div>
+            <p id="runLogSummary" class="soft-text">로그 정보를 불러오는 중...</p>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

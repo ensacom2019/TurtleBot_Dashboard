@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Local dashboard state and user data
+config/dashboard_state.json
+data/maps/
+data/map-*
+run_logs/
+dashboard_server.log
+dashboard_server.err.log
+
+# Local Codex attachments and generated packages
+.codex-remote-attachments/
+TurtleBot_dashboard_*.zip
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local secrets
+.env
+*.pem
+*.key
