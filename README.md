@@ -2,6 +2,20 @@
 
 TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지도 설정, A* 경로 계획, LiDAR 기반 비상 주행, 수동 운전, 카메라 확인, 로봇 SSH 브링업을 한 화면에서 다룹니다.
 
+## 화면
+
+### 셋업 대시보드
+
+지도, 벽, 장애물, 로봇 footprint와 안전 반경을 한 화면에서 설정합니다.
+
+![TurtleBot Dashboard setup screen](docs/images/dashboard-overview.png)
+
+### 기본 맵 도면
+
+기본 맵의 벽 배치는 아래 도면을 기준으로 하며, 대시보드의 `맵 제작` 탭에서 직접 수정하거나 새 맵으로 저장할 수 있습니다.
+
+![Default TurtleBot map](data/Sprite-1.png)
+
 ## 주요 기능
 
 - 셋업 / 주행 / 맵 제작 탭
