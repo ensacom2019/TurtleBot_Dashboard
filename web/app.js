@@ -42,11 +42,6 @@ const DEFAULT_ROBOT_PROFILES = {
     namespace: "/",
     topics: topicsForNamespace("/", "camera_ros"),
   },
-  tb3_1: {
-    label: "TurtleBot 1",
-    namespace: "/tb3_1",
-    topics: topicsForNamespace("/tb3_1", "color"),
-  },
 };
 
 const els = {};
@@ -84,7 +79,6 @@ function bindElements() {
     "clearGridButton",
     "robotIp",
     "activeRobotProfile",
-    "robotProfileButtons",
     "serverIp",
     "rosDomainId",
     "rosLocalhostOnly",
@@ -1144,6 +1138,7 @@ function addDiscoveredRobotProfiles(candidates) {
     profiles[profileId] = {
       label: robotNumber ? `TurtleBot ${robotNumber}` : `TurtleBot ${namespace.replace(/^\//, "")}`,
       namespace,
+      source: "discovered",
       topics: {
         ...topicsForNamespace(namespace, "color"),
         ...(candidate.recommendedTopics || {}),
@@ -1217,18 +1212,6 @@ function renderRobotProfileControls(setup) {
   if (els.activeRobotProfile.innerHTML !== options) {
     els.activeRobotProfile.innerHTML = options;
   }
-  els.robotProfileButtons.innerHTML = Object.entries(profiles)
-    .map(([id, profile]) => {
-      const active = id === activeRobot ? " active" : "";
-      return `<button type="button" class="${active}" data-robot-profile="${escapeHtml(id)}">${escapeHtml(profile.label)}</button>`;
-    })
-    .join("");
-  els.robotProfileButtons.querySelectorAll("[data-robot-profile]").forEach((button) => {
-    button.addEventListener("click", () => {
-      els.activeRobotProfile.value = button.dataset.robotProfile;
-      applyRobotProfile(button.dataset.robotProfile);
-    });
-  });
 }
 
 function applyRobotProfile(profileId) {
@@ -1909,6 +1892,7 @@ function normalizedRobotProfiles(setup = state.data?.setup || {}) {
     profiles[id] = {
       label: profile.label || fallback.label || id,
       namespace,
+      source: profile.source || fallback.source || "",
       topics: {
         ...topicsForNamespace(namespace, cameraStyle),
         ...(fallback.topics || {}),

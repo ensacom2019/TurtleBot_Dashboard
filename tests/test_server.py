@@ -28,6 +28,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(setup["map"]["id"], "default-map")
         self.assertEqual(setup["mapLibrary"][0]["name"], "기본 맵")
 
+    def test_default_robot_profile_only_contains_turtlebot_2(self) -> None:
+        profiles = server.DEFAULT_STATE["setup"]["robotProfiles"]
+        self.assertEqual(list(profiles), ["tb3_2"])
+
+    def test_legacy_turtlebot_1_profile_is_removed_but_discovered_profile_remains(self) -> None:
+        legacy_state = server.deep_merge(
+            server.DEFAULT_STATE,
+            {
+                "setup": {
+                    "activeRobot": "tb3_1",
+                    "robotProfiles": {"tb3_1": {"namespace": "/tb3_1"}},
+                }
+            },
+        )
+        normalized_legacy = server.normalize_robot_profiles_state(legacy_state)
+        self.assertEqual(list(normalized_legacy["setup"]["robotProfiles"]), ["tb3_2"])
+        self.assertEqual(normalized_legacy["setup"]["activeRobot"], "tb3_2")
+
+        discovered_state = server.deep_merge(
+            server.DEFAULT_STATE,
+            {
+                "setup": {
+                    "robotProfiles": {
+                        "tb3_1": {"namespace": "/tb3_1", "source": "discovered"}
+                    }
+                }
+            },
+        )
+        normalized_discovered = server.normalize_robot_profiles_state(discovered_state)
+        self.assertIn("tb3_1", normalized_discovered["setup"]["robotProfiles"])
+
     def test_map_editor_dimensions_require_whole_centimeters(self) -> None:
         self.assertEqual(
             server.parse_map_editor_dimensions({"widthCm": 180, "heightCm": 120}),

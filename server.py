@@ -35,7 +35,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-14.53"
+APP_VERSION = "2026-07-14.54"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -92,11 +92,6 @@ DEFAULT_ROBOT_PROFILES = {
         "label": "TurtleBot 2",
         "namespace": "/",
         "topics": topics_for_namespace("/", "camera_ros"),
-    },
-    "tb3_1": {
-        "label": "TurtleBot 1",
-        "namespace": "/tb3_1",
-        "topics": topics_for_namespace("/tb3_1", "color"),
     },
 }
 
@@ -250,6 +245,26 @@ def deep_merge(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]
         else:
             merged[key] = value
     return merged
+
+
+def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only TurtleBot 2 initially; retain profiles added by robot discovery."""
+    setup = state.setdefault("setup", {})
+    profiles = setup.get("robotProfiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    legacy_tb3_1 = profiles.get("tb3_1")
+    if isinstance(legacy_tb3_1, dict) and legacy_tb3_1.get("source") != "discovered":
+        profiles.pop("tb3_1", None)
+    if "tb3_2" not in profiles:
+        profiles["tb3_2"] = json.loads(json.dumps(DEFAULT_ROBOT_PROFILES["tb3_2"]))
+    setup["robotProfiles"] = profiles
+    active_robot = str(setup.get("activeRobot") or "tb3_2")
+    if active_robot not in profiles:
+        active_robot = "tb3_2"
+        setup["activeRobot"] = active_robot
+        setup["topics"] = dict(profiles[active_robot].get("topics") or {})
+    return state
 
 
 def finite_float(value: Any, field_name: str) -> float:
@@ -2507,14 +2522,14 @@ class DashboardState:
         if SETTINGS_PATH.exists():
             try:
                 data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                state = deep_merge(DEFAULT_STATE, data)
+                state = normalize_robot_profiles_state(deep_merge(DEFAULT_STATE, data))
                 state.setdefault("runtime", {})["appVersion"] = APP_VERSION
                 return state
             except Exception:
-                state = json.loads(json.dumps(DEFAULT_STATE))
+                state = normalize_robot_profiles_state(json.loads(json.dumps(DEFAULT_STATE)))
                 state.setdefault("runtime", {})["appVersion"] = APP_VERSION
                 return state
-        state = json.loads(json.dumps(DEFAULT_STATE))
+        state = normalize_robot_profiles_state(json.loads(json.dumps(DEFAULT_STATE)))
         state.setdefault("runtime", {})["appVersion"] = APP_VERSION
         return state
 

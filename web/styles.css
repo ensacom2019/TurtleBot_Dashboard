@@ -246,19 +246,6 @@ main {
   font-size: 17px;
 }
 
-.robot-profile-buttons {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 8px;
-}
-
-.robot-profile-buttons button.active {
-  border-color: var(--accent-2);
-  background: var(--accent-2);
-  color: #07131a;
-  font-weight: 800;
-}
-
 label {
   display: grid;
   gap: 5px;
