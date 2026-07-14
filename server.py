@@ -35,7 +35,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-14.54"
+APP_VERSION = "2026-07-14.55"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -49,6 +49,9 @@ FALLBACK_RECOVERY_MAX_ATTEMPTS = 4
 FALLBACK_RECOVERY_ESCAPE_MIN_IMPROVEMENT = 0.002
 FALLBACK_RECOVERY_ESCAPE_MAX_WORSENING = 0.003
 FALLBACK_RECOVERY_TRAPPED_RETRY_SECONDS = 0.75
+FALLBACK_LIDAR_COAST_SECONDS = 0.8
+FALLBACK_LIDAR_COAST_MIN_CLEARANCE = 0.12
+FALLBACK_LIDAR_COAST_MAX_ANGULAR = 0.25
 NANOSECONDS_PER_SECOND = 1_000_000_000
 ROBOT_CLOCK_FRESH_SECONDS = 2.0
 MAX_JSON_BODY_BYTES = 24 * 1024 * 1024
@@ -220,6 +223,9 @@ DEFAULT_STATE: Dict[str, Any] = {
         "lidarMinClearance": None,
         "fallbackRecoveryPhase": None,
         "fallbackRecoveryAttempts": 0,
+        "lidarConnection": "unknown",
+        "lidarConnectionMessage": "LiDAR scan 대기 중",
+        "lidarConnectionChangedAt": None,
         "lidarPoints": [],
         "lidarPose": None,
         "lidarPointCount": 0,
@@ -503,6 +509,51 @@ def evaluate_lidar_safety(
         "slow": slow,
         "recoveryRequired": recovery_required,
     }
+
+
+def lidar_coast_allowed(
+    scan_age: float,
+    odom_age: float,
+    pose_age: float,
+    settings: Dict[str, Any],
+    last_safety: Optional[Dict[str, Any]],
+) -> bool:
+    """Allow a short, low-speed coast only after a recently clear LiDAR scan."""
+    if not last_safety or not math.isfinite(scan_age):
+        return False
+    if scan_age <= settings["scanTimeout"]:
+        return False
+    if scan_age > settings["scanTimeout"] + FALLBACK_LIDAR_COAST_SECONDS:
+        return False
+    if odom_age > settings["odomTimeout"] or pose_age > settings["odomTimeout"]:
+        return False
+    if bool(last_safety.get("recoveryRequired")) or bool(last_safety.get("collision")):
+        return False
+    clearance = last_safety.get("motionClearance")
+    if clearance is None:
+        clearance = last_safety.get("minClearance")
+    try:
+        clearance_value = float(clearance)
+    except (TypeError, ValueError):
+        return False
+    required_clearance = max(
+        FALLBACK_LIDAR_COAST_MIN_CLEARANCE,
+        float(settings.get("softDistance") or 0.0),
+    )
+    return math.isfinite(clearance_value) and clearance_value >= required_clearance
+
+
+def lidar_coast_command(command: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[float, float]:
+    requested_linear = float(command.get("linear") or 0.0)
+    requested_angular = float(command.get("angular") or 0.0)
+    if abs(requested_linear) <= 1e-4:
+        linear = 0.0
+    else:
+        linear = math.copysign(
+            min(float(settings["minLinear"]), abs(requested_linear)), requested_linear
+        )
+    angular_limit = min(float(settings["maxAngular"]), FALLBACK_LIDAR_COAST_MAX_ANGULAR)
+    return linear, clamp(requested_angular, -angular_limit, angular_limit)
 
 
 def choose_lidar_recovery_turn(points: list[Tuple[float, float]]) -> int:
@@ -3570,10 +3621,20 @@ class RosBridge:
                 "received": received,
                 "frame": str(getattr(msg.header, "frame_id", "") or ""),
             }
-        patch: Dict[str, Any] = {"lastScanAt": now_iso(), "scanAgeMs": 0}
+        changed_at = now_iso()
+        runtime = self.state.snapshot().get("runtime", {})
+        patch: Dict[str, Any] = {"lastScanAt": changed_at, "scanAgeMs": 0}
+        if runtime.get("lidarConnection") != "connected":
+            patch.update(
+                {
+                    "lidarConnection": "connected",
+                    "lidarConnectionMessage": "LiDAR 연결 정상 · 속도 복구",
+                    "lidarConnectionChangedAt": changed_at,
+                }
+            )
         if received - self._last_lidar_display >= 0.2:
             self._last_lidar_display = received
-            display_pose = self.state.snapshot().get("runtime", {}).get("pose")
+            display_pose = runtime.get("pose")
             patch.update(
                 {
                     "lidarPoints": sample_lidar_points(points),
@@ -4167,6 +4228,7 @@ class RosBridge:
             "attempts": 0,
             "turn": 0,
         }
+        last_safe_safety: Optional[Dict[str, Any]] = None
         period = 0.1
         try:
             while not self._shutdown_event.is_set() and self._fallback_generation_current(generation):
@@ -4189,11 +4251,7 @@ class RosBridge:
                     if self._last_pose_monotonic > 0
                     else math.inf
                 )
-                if (
-                    scan_age > settings["scanTimeout"]
-                    or odom_age > settings["odomTimeout"]
-                    or pose_age > settings["odomTimeout"]
-                ):
+                if odom_age > settings["odomTimeout"] or pose_age > settings["odomTimeout"]:
                     recovery = {
                         "phase": "none",
                         "started": 0.0,
@@ -4204,13 +4262,14 @@ class RosBridge:
                     if not self._fallback_generation_current(generation):
                         return
                     if cycle_started - last_runtime_update >= 0.2:
-                        missing = []
-                        if scan_age > settings["scanTimeout"]:
-                            missing.append("scan")
-                        if odom_age > settings["odomTimeout"]:
-                            missing.append("odom")
-                        if pose_age > settings["odomTimeout"]:
-                            missing.append("pose")
+                        missing = [
+                            name
+                            for name, age, limit in (
+                                ("odom", odom_age, settings["odomTimeout"]),
+                                ("pose", pose_age, settings["odomTimeout"]),
+                            )
+                            if age > limit
+                        ]
                         self.state.update_runtime(
                             {
                                 "navStatus": "fallback_sensor_stop",
@@ -4218,6 +4277,9 @@ class RosBridge:
                                 "fallbackSpeedScale": 0.0,
                                 "fallbackRecoveryPhase": None,
                                 "fallbackRecoveryAttempts": recovery["attempts"],
+                                "lidarConnection": "lost",
+                                "lidarConnectionMessage": "위치 데이터 끊김 · 안전 정지",
+                                "lidarConnectionChangedAt": now_iso(),
                                 "scanAgeMs": None if not math.isfinite(scan_age) else round(scan_age * 1000),
                                 "odomAgeMs": (
                                     None
@@ -4330,6 +4392,110 @@ class RosBridge:
                     )
                     return
 
+                if scan_age > settings["scanTimeout"]:
+                    recovery = {
+                        "phase": "none",
+                        "started": 0.0,
+                        "attempts": 0,
+                        "turn": 0,
+                    }
+                    if lidar_coast_allowed(
+                        scan_age, odom_age, pose_age, settings, last_safe_safety
+                    ):
+                        linear, angular = lidar_coast_command(command, settings)
+                        requested_linear = float(command.get("linear") or 0.0)
+                        speed_scale = (
+                            abs(linear) / abs(requested_linear)
+                            if abs(requested_linear) > 1e-4
+                            else 1.0
+                        )
+                        if not self._fallback_generation_current(generation):
+                            return
+                        self._publish_cmd_vel(linear, angular)
+                        while route_index < len(route) - 1:
+                            route_target = route[route_index]
+                            route_distance = math.hypot(
+                                float(route_target["x"]) - float(pose["x"]),
+                                float(route_target["y"]) - float(pose["y"]),
+                            )
+                            if route_distance > max(
+                                settings["lookahead"], settings["goalTolerance"] * 1.5
+                            ):
+                                break
+                            route_index += 1
+                        if cycle_started - last_run_log >= 0.5:
+                            self.state.log_run_event(
+                                "fallback_lidar_coast",
+                                pose=pose,
+                                pathIndex=path_index,
+                                pathLength=len(path),
+                                routeIndex=route_index,
+                                command={"linear": linear, "angular": angular},
+                                scanAgeMs=round(scan_age * 1000),
+                                odomAgeMs=round(max(odom_age, pose_age) * 1000),
+                                lastSafety=last_safe_safety,
+                            )
+                            last_run_log = cycle_started
+                        if cycle_started - last_runtime_update >= 0.2:
+                            clearance = last_safe_safety.get("minClearance")
+                            connection_changed = runtime.get("lidarConnection") != "degraded"
+                            self.state.update_runtime(
+                                {
+                                    "goal": route[route_index],
+                                    "routeIndex": route_index,
+                                    "navStatus": "fallback_lidar_coast",
+                                    "navMessage": (
+                                        "LiDAR scan 끊김 · 마지막 안전 scan 기준 저속 주행 "
+                                        f"({scan_age - settings['scanTimeout']:.1f}/"
+                                        f"{FALLBACK_LIDAR_COAST_SECONDS:.1f}s)."
+                                    ),
+                                    "fallbackActive": True,
+                                    "fallbackPathIndex": path_index,
+                                    "fallbackSpeedScale": round(speed_scale, 3),
+                                    "lidarMinClearance": (
+                                        None if clearance is None else round(float(clearance), 3)
+                                    ),
+                                    "fallbackRecoveryPhase": "none",
+                                    "fallbackRecoveryAttempts": 0,
+                                    "lidarConnection": "degraded",
+                                    "lidarConnectionMessage": "LiDAR 연결 끊김 · 마지막 안전 scan 기준 저속 주행",
+                                    "lidarConnectionChangedAt": (
+                                        now_iso() if connection_changed else runtime.get("lidarConnectionChangedAt")
+                                    ),
+                                    "scanAgeMs": round(scan_age * 1000),
+                                    "odomAgeMs": round(odom_age * 1000),
+                                    "lastCommandAt": now_iso(),
+                                }
+                            )
+                            last_runtime_update = cycle_started
+                        self._shutdown_event.wait(
+                            max(0.0, period - (time.monotonic() - cycle_started))
+                        )
+                        continue
+
+                    self._publish_cmd_vel(0.0, 0.0)
+                    if not self._fallback_generation_current(generation):
+                        return
+                    if cycle_started - last_runtime_update >= 0.2:
+                        self.state.update_runtime(
+                            {
+                                "navStatus": "fallback_sensor_stop",
+                                "navMessage": "LiDAR fallback stopped: stale scan.",
+                                "fallbackSpeedScale": 0.0,
+                                "fallbackRecoveryPhase": None,
+                                "fallbackRecoveryAttempts": 0,
+                                "lidarConnection": "lost",
+                                "lidarConnectionMessage": "LiDAR 연결 끊김 · 안전 정지",
+                                "lidarConnectionChangedAt": now_iso(),
+                                "scanAgeMs": None if not math.isfinite(scan_age) else round(scan_age * 1000),
+                                "odomAgeMs": round(max(odom_age, pose_age) * 1000),
+                                "lastCommandAt": now_iso(),
+                            }
+                        )
+                        last_runtime_update = cycle_started
+                    self._shutdown_event.wait(max(0.0, period - (time.monotonic() - cycle_started)))
+                    continue
+
                 safety = evaluate_lidar_safety(
                     scan["points"],
                     float(command.get("linear", 0.0)),
@@ -4340,6 +4506,8 @@ class RosBridge:
                     settings["collisionHorizon"],
                 )
                 blocked = bool(safety["recoveryRequired"])
+                if not blocked and not bool(safety["collision"]):
+                    last_safe_safety = dict(safety)
                 speed_scale = 1.0
                 if blocked:
                     recovery = next_lidar_recovery_command(

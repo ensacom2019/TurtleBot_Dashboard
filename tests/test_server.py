@@ -212,6 +212,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["recoveryRequired"])
         self.assertFalse(result["slow"])
 
+    def test_lidar_coast_requires_recent_clear_scan_and_fresh_pose(self) -> None:
+        settings = server.normalized_fallback_settings({"fallbackNavigation": {}})
+        last_safety = {
+            "recoveryRequired": False,
+            "collision": False,
+            "minClearance": 0.05,
+            "motionClearance": 0.30,
+        }
+        self.assertTrue(
+            server.lidar_coast_allowed(0.8, 0.1, 0.1, settings, last_safety)
+        )
+        self.assertFalse(
+            server.lidar_coast_allowed(1.5, 0.1, 0.1, settings, last_safety)
+        )
+        self.assertFalse(
+            server.lidar_coast_allowed(0.8, 0.7, 0.1, settings, last_safety)
+        )
+        self.assertFalse(
+            server.lidar_coast_allowed(
+                0.8, 0.1, 0.1, settings, {**last_safety, "collision": True}
+            )
+        )
+
+    def test_lidar_coast_command_caps_speed_and_turn(self) -> None:
+        settings = server.normalized_fallback_settings({"fallbackNavigation": {}})
+        linear, angular = server.lidar_coast_command(
+            {"linear": 0.08, "angular": 0.6}, settings
+        )
+        self.assertEqual(linear, settings["minLinear"])
+        self.assertEqual(angular, server.FALLBACK_LIDAR_COAST_MAX_ANGULAR)
+
     def test_lidar_safety_keeps_speed_in_clear_space(self) -> None:
         footprint = {"front": 0.15, "back": 0.15, "left": 0.10, "right": 0.10}
         result = server.evaluate_lidar_safety(

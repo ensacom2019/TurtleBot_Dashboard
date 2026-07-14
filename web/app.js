@@ -627,9 +627,17 @@ function fillRuntime(runtime) {
   els.statusGoal.textContent = formatRuntimeGoal(runtime);
   els.statusPath.textContent = state.plannedPath.status || "-";
   const lidarPointCount = runtime.lidarPointCount ?? runtime.lidarPoints?.length ?? 0;
+  const lidarConnection = runtime.lidarConnection || "unknown";
+  const lidarState = lidarConnection === "connected"
+    ? "연결"
+    : lidarConnection === "degraded"
+      ? "저속 유예"
+      : lidarConnection === "lost"
+        ? "끊김"
+        : "대기";
   els.statusSafety.textContent = runtime.fallbackActive
-    ? `scale ${runtime.fallbackSpeedScale ?? "-"} · clearance ${runtime.lidarMinClearance ?? "-"} m · recovery ${runtime.fallbackRecoveryPhase ?? "none"} · LiDAR ${lidarPointCount} pts · scan ${runtime.scanAgeMs ?? "-"} ms`
-    : `LiDAR ${lidarPointCount} pts`;
+    ? `LiDAR ${lidarState} · scale ${runtime.fallbackSpeedScale ?? "-"} · clearance ${runtime.lidarMinClearance ?? "-"} m · recovery ${runtime.fallbackRecoveryPhase ?? "none"} · ${lidarPointCount} pts · scan ${runtime.scanAgeMs ?? "-"} ms`
+    : `LiDAR ${lidarState} · ${lidarPointCount} pts`;
 }
 
 function updateCameraUi(runtime = state.data?.runtime || {}) {
@@ -3325,6 +3333,7 @@ function drawMap(canvas, mode) {
 
   drawPlanningOverlay(ctx, canvas, setup, mode);
   drawLidarPoints(ctx, canvas, runtime, setup);
+  if (mode === "drive") drawLidarConnectionAlarm(ctx, canvas, runtime);
   if (mode === "drive") {
     drawWaypointMarkers(ctx, canvas);
   }
@@ -3342,6 +3351,39 @@ function drawMap(canvas, mode) {
   if (goal) {
     drawGoal(ctx, canvas, goal);
   }
+}
+
+function drawLidarConnectionAlarm(ctx, canvas, runtime) {
+  const connection = runtime.lidarConnection || "unknown";
+  const messages = {
+    connected: "LiDAR 연결 정상 · 속도 복구",
+    degraded: "LiDAR 연결 끊김 · 저속 주행",
+    lost: "LiDAR 연결 끊김 · 안전 정지",
+    unknown: "LiDAR scan 대기 중",
+  };
+  const colors = {
+    connected: { fill: "rgba(30, 102, 72, 0.93)", stroke: "#4fb477" },
+    degraded: { fill: "rgba(105, 76, 20, 0.94)", stroke: "#e8b85f" },
+    lost: { fill: "rgba(112, 42, 42, 0.94)", stroke: "#df6262" },
+    unknown: { fill: "rgba(49, 62, 69, 0.94)", stroke: "#9eaeb6" },
+  };
+  const message = runtime.lidarConnectionMessage || messages[connection] || messages.unknown;
+  const color = colors[connection] || colors.unknown;
+  ctx.save();
+  ctx.font = "600 13px Inter, system-ui, sans-serif";
+  const width = Math.min(canvas.width - 24, Math.ceil(ctx.measureText(message).width) + 28);
+  const height = 32;
+  const x = canvas.width - width - 12;
+  const y = 12;
+  ctx.fillStyle = color.fill;
+  ctx.strokeStyle = color.stroke;
+  ctx.lineWidth = 1;
+  ctx.fillRect(x, y, width, height);
+  ctx.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
+  ctx.fillStyle = "#f5fbfc";
+  ctx.textBaseline = "middle";
+  ctx.fillText(message, x + 14, y + height / 2);
+  ctx.restore();
 }
 
 function drawLidarPoints(ctx, canvas, runtime, setup) {
