@@ -75,6 +75,7 @@ function bindElements() {
     "showGrid",
     "showInflation",
     "showLidarPoints",
+    "detectLidarObstacles",
     "detectBlackWalls",
     "clearGridButton",
     "robotIp",
@@ -478,6 +479,7 @@ function fillSetupForm(setup) {
   setInputIfIdle(els.showGrid, setup.planner?.showGrid ?? true);
   setInputIfIdle(els.showInflation, setup.planner?.showInflation ?? true);
   setInputIfIdle(els.showLidarPoints, setup.planner?.showLidarPoints ?? true);
+  setInputIfIdle(els.detectLidarObstacles, setup.planner?.detectLidarObstacles ?? true);
   setInputIfIdle(els.detectBlackWalls, setup.planner?.detectBlackWalls ?? true);
   renderRobotProfileControls(setup);
   setInputIfIdle(els.activeRobotProfile, setup.activeRobot || "tb3_2");
@@ -627,6 +629,7 @@ function fillRuntime(runtime) {
   els.statusGoal.textContent = formatRuntimeGoal(runtime);
   els.statusPath.textContent = state.plannedPath.status || "-";
   const lidarPointCount = runtime.lidarPointCount ?? runtime.lidarPoints?.length ?? 0;
+  const dynamicObstacleCount = runtime.dynamicLidarObstacleCount ?? runtime.dynamicLidarObstacles?.length ?? 0;
   const lidarConnection = runtime.lidarConnection || "unknown";
   const lidarState = lidarConnection === "connected"
     ? "연결"
@@ -636,8 +639,8 @@ function fillRuntime(runtime) {
         ? "끊김"
         : "대기";
   els.statusSafety.textContent = runtime.fallbackActive
-    ? `LiDAR ${lidarState} · scale ${runtime.fallbackSpeedScale ?? "-"} · clearance ${runtime.lidarMinClearance ?? "-"} m · recovery ${runtime.fallbackRecoveryPhase ?? "none"} · ${lidarPointCount} pts · scan ${runtime.scanAgeMs ?? "-"} ms`
-    : `LiDAR ${lidarState} · ${lidarPointCount} pts`;
+    ? `LiDAR ${lidarState} · scale ${runtime.fallbackSpeedScale ?? "-"} · clearance ${runtime.lidarMinClearance ?? "-"} m · recovery ${runtime.fallbackRecoveryPhase ?? "none"} · ${lidarPointCount} pts · 임시 ${dynamicObstacleCount} · scan ${runtime.scanAgeMs ?? "-"} ms`
+    : `LiDAR ${lidarState} · ${lidarPointCount} pts · 임시 ${dynamicObstacleCount}`;
 }
 
 function updateCameraUi(runtime = state.data?.runtime || {}) {
@@ -1843,6 +1846,7 @@ function currentSetup() {
       showGrid: checkboxValue(els.showGrid),
       showInflation: checkboxValue(els.showInflation),
       showLidarPoints: checkboxValue(els.showLidarPoints),
+      detectLidarObstacles: checkboxValue(els.detectLidarObstacles),
       detectBlackWalls: checkboxValue(els.detectBlackWalls),
       blockedCells: normalizeBlockedCells(fallback.planner?.blockedCells || []),
       freeCells: normalizeBlockedCells(fallback.planner?.freeCells || []),
@@ -2228,13 +2232,26 @@ function blockedCellSet(setup) {
   for (const key of obstacleCellKeys(setup)) {
     cells.add(key);
   }
+  for (const key of dynamicLidarObstacleCellKeys(setup)) {
+    cells.add(key);
+  }
   return cells;
 }
 
 function obstacleCellKeys(setup) {
+  return obstacleCellsFor(normalizeObstacles(setup.obstacles || []), setup);
+}
+
+function dynamicLidarObstacleCellKeys(setup) {
+  if (!setup.planner?.detectLidarObstacles) return new Set();
+  const obstacles = normalizeObstacles(state.data?.runtime?.dynamicLidarObstacles || []);
+  return obstacleCellsFor(obstacles, setup);
+}
+
+function obstacleCellsFor(obstacles, setup) {
   const metrics = mapMetrics(setup);
   const keys = new Set();
-  for (const obstacle of normalizeObstacles(setup.obstacles || [])) {
+  for (const obstacle of obstacles) {
     const minX = Math.floor((obstacle.x - obstacle.width / 2 - metrics.originX) / metrics.cellSize);
     const maxX = Math.floor((obstacle.x + obstacle.width / 2 - metrics.originX) / metrics.cellSize);
     const minY = Math.floor((obstacle.y - obstacle.height / 2 - metrics.originY) / metrics.cellSize);
@@ -2604,6 +2621,7 @@ function setupInputs() {
     els.showGrid,
     els.showInflation,
     els.showLidarPoints,
+    els.detectLidarObstacles,
     els.detectBlackWalls,
     els.robotIp,
     els.serverIp,
@@ -3423,6 +3441,8 @@ function drawLidarPoints(ctx, canvas, runtime, setup) {
 
 function drawPlanningOverlay(ctx, canvas, setup, mode) {
   const occupied = blockedCellSet(setup);
+  const dynamicOccupied = dynamicLidarObstacleCellKeys(setup);
+  const staticOccupied = new Set(Array.from(occupied).filter((key) => !dynamicOccupied.has(key)));
   const hardInflated = inflatedCellSet(setup);
   const softInflated = softInflatedCellSet(setup);
   const free = new Set(normalizeBlockedCells(setup.planner?.freeCells || []));
@@ -3433,7 +3453,8 @@ function drawPlanningOverlay(ctx, canvas, setup, mode) {
     drawCellSet(ctx, canvas, setup, hardOnly, "rgba(223, 98, 98, 0.22)", 12000);
   }
   drawCellSet(ctx, canvas, setup, free, "rgba(79, 180, 119, 0.34)", 12000);
-  drawCellSet(ctx, canvas, setup, occupied, "rgba(223, 98, 98, 0.48)", 12000);
+  drawCellSet(ctx, canvas, setup, staticOccupied, "rgba(223, 98, 98, 0.48)", 12000);
+  drawCellSet(ctx, canvas, setup, dynamicOccupied, "rgba(239, 165, 71, 0.62)", 12000);
   if (setup.planner?.showGrid) {
     drawPlannerGrid(ctx, canvas, setup);
   }

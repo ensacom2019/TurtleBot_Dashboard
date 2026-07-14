@@ -35,7 +35,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-14.55"
+APP_VERSION = "2026-07-14.56"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -52,6 +52,11 @@ FALLBACK_RECOVERY_TRAPPED_RETRY_SECONDS = 0.75
 FALLBACK_LIDAR_COAST_SECONDS = 0.8
 FALLBACK_LIDAR_COAST_MIN_CLEARANCE = 0.12
 FALLBACK_LIDAR_COAST_MAX_ANGULAR = 0.25
+DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE = 0.08
+DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS = 4
+DYNAMIC_LIDAR_OBSTACLE_HOLD_SECONDS = 1.0
+DYNAMIC_LIDAR_OBSTACLE_MIN_RANGE = 0.18
+DYNAMIC_LIDAR_OBSTACLE_MAX_RANGE = 2.5
 NANOSECONDS_PER_SECOND = 1_000_000_000
 ROBOT_CLOCK_FRESH_SECONDS = 2.0
 MAX_JSON_BODY_BYTES = 24 * 1024 * 1024
@@ -155,6 +160,7 @@ DEFAULT_STATE: Dict[str, Any] = {
             "showGrid": True,
             "showInflation": True,
             "showLidarPoints": True,
+            "detectLidarObstacles": True,
             "detectBlackWalls": True,
             "blockedCells": [],
             "freeCells": [],
@@ -227,6 +233,8 @@ DEFAULT_STATE: Dict[str, Any] = {
         "lidarConnectionMessage": "LiDAR scan 대기 중",
         "lidarConnectionChangedAt": None,
         "lidarPoints": [],
+        "dynamicLidarObstacles": [],
+        "dynamicLidarObstacleCount": 0,
         "lidarPose": None,
         "lidarPointCount": 0,
         "lidarFrame": "",
@@ -403,6 +411,70 @@ def sample_lidar_points(
         [round(float(x), 3), round(float(y), 3)]
         for x, y in points[::stride][:max_points]
     ]
+
+
+def lidar_dynamic_obstacle_cells(
+    points: list[Tuple[float, float]],
+    pose: Optional[Dict[str, Any]],
+    cell_size: float = DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE,
+    min_points: int = DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS,
+) -> list[Dict[str, Any]]:
+    """Return dense LiDAR cells in map coordinates for short-lived obstacles."""
+    if not pose or cell_size <= 0.0 or min_points < 1:
+        return []
+    try:
+        pose_x = float(pose["x"])
+        pose_y = float(pose["y"])
+        yaw = float(pose.get("yaw", 0.0))
+    except (KeyError, TypeError, ValueError):
+        return []
+    if not all(math.isfinite(value) for value in (pose_x, pose_y, yaw)):
+        return []
+
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    counts: Dict[Tuple[int, int], int] = {}
+    for local_x, local_y in points:
+        distance = math.hypot(local_x, local_y)
+        if not DYNAMIC_LIDAR_OBSTACLE_MIN_RANGE <= distance <= DYNAMIC_LIDAR_OBSTACLE_MAX_RANGE:
+            continue
+        world_x = pose_x + cos_yaw * local_x - sin_yaw * local_y
+        world_y = pose_y + sin_yaw * local_x + cos_yaw * local_y
+        key = (math.floor(world_x / cell_size), math.floor(world_y / cell_size))
+        counts[key] = counts.get(key, 0) + 1
+
+    cells = []
+    unvisited = set(counts)
+    while unvisited:
+        first = unvisited.pop()
+        component = [first]
+        queue = [first]
+        while queue:
+            grid_x, grid_y = queue.pop()
+            for offset_x in (-1, 0, 1):
+                for offset_y in (-1, 0, 1):
+                    if offset_x == 0 and offset_y == 0:
+                        continue
+                    neighbor = (grid_x + offset_x, grid_y + offset_y)
+                    if neighbor in unvisited:
+                        unvisited.remove(neighbor)
+                        queue.append(neighbor)
+                        component.append(neighbor)
+        point_count = sum(counts[key] for key in component)
+        if point_count < min_points:
+            continue
+        for grid_x, grid_y in component:
+            cells.append(
+                {
+                    "id": f"lidar-{grid_x}-{grid_y}",
+                    "x": round((grid_x + 0.5) * cell_size, 3),
+                    "y": round((grid_y + 0.5) * cell_size, 3),
+                    "width": cell_size,
+                    "height": cell_size,
+                    "points": point_count,
+                }
+            )
+    return cells
 
 
 def rectangle_clearance(
@@ -3367,6 +3439,7 @@ class RosBridge:
         self._last_amcl = 0.0
         self._last_lidar_display = 0.0
         self._last_sensor_run_log = 0.0
+        self._dynamic_lidar_obstacle_tracks: Dict[str, Dict[str, Any]] = {}
         self._last_logged_manual_command: Optional[Tuple[float, float]] = None
         self._spin_thread: Optional[threading.Thread] = None
         self._publisher_lock = threading.RLock()
@@ -3544,6 +3617,10 @@ class RosBridge:
         self._pending_odom_anchor = None
         with self._scan_lock:
             self._latest_scan = {"points": [], "received": 0.0, "frame": ""}
+        self._dynamic_lidar_obstacle_tracks.clear()
+        self.state.update_runtime(
+            {"dynamicLidarObstacles": [], "dynamicLidarObstacleCount": 0}
+        )
         self._reset_robot_clock()
         try:
             self._init_ros()
@@ -3606,6 +3683,32 @@ class RosBridge:
             }
         )
 
+    def _update_dynamic_lidar_obstacles(
+        self, points: list[Tuple[float, float]], pose: Optional[Dict[str, Any]], received: float
+    ) -> list[Dict[str, Any]]:
+        planner = self.state.get_setup().get("planner", {}) or {}
+        if not bool(planner.get("detectLidarObstacles", True)):
+            self._dynamic_lidar_obstacle_tracks.clear()
+            return []
+
+        for obstacle in lidar_dynamic_obstacle_cells(points, pose):
+            track = dict(obstacle)
+            track["lastSeen"] = received
+            self._dynamic_lidar_obstacle_tracks[track["id"]] = track
+        self._dynamic_lidar_obstacle_tracks = {
+            obstacle_id: track
+            for obstacle_id, track in self._dynamic_lidar_obstacle_tracks.items()
+            if received - float(track.get("lastSeen", 0.0)) <= DYNAMIC_LIDAR_OBSTACLE_HOLD_SECONDS
+        }
+        return [
+            {
+                key: value
+                for key, value in track.items()
+                if key != "lastSeen"
+            }
+            for _, track in sorted(self._dynamic_lidar_obstacle_tracks.items())
+        ]
+
     def _on_scan(self, msg: Any) -> None:
         received = time.monotonic()
         points = laser_scan_points(
@@ -3623,6 +3726,9 @@ class RosBridge:
             }
         changed_at = now_iso()
         runtime = self.state.snapshot().get("runtime", {})
+        dynamic_obstacles = self._update_dynamic_lidar_obstacles(
+            points, runtime.get("pose"), received
+        )
         patch: Dict[str, Any] = {"lastScanAt": changed_at, "scanAgeMs": 0}
         if runtime.get("lidarConnection") != "connected":
             patch.update(
@@ -3641,6 +3747,8 @@ class RosBridge:
                     "lidarPose": display_pose,
                     "lidarPointCount": len(points),
                     "lidarFrame": str(getattr(msg.header, "frame_id", "") or ""),
+                    "dynamicLidarObstacles": dynamic_obstacles,
+                    "dynamicLidarObstacleCount": len(dynamic_obstacles),
                 }
             )
         self.state.update_runtime(patch)
@@ -3660,6 +3768,7 @@ class RosBridge:
             self.state.log_run_event(
                 "sensor_sample",
                 scanPointCount=len(points),
+                dynamicLidarObstacleCount=len(dynamic_obstacles),
                 scanFrame=str(getattr(msg.header, "frame_id", "") or ""),
                 scanAgeMs=0,
                 odomAgeMs=None if not math.isfinite(odom_age) else round(odom_age * 1000),

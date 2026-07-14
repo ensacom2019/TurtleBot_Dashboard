@@ -183,6 +183,21 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(sampled[0], [0.0, 0.0])
         self.assertEqual(sampled[1], [0.003, -0.002])
 
+    def test_lidar_dynamic_obstacles_require_dense_points_and_transform_to_map(self) -> None:
+        obstacles = server.lidar_dynamic_obstacle_cells(
+            [(1.00, 0.01), (1.01, 0.02), (1.015, 0.03), (1.018, 0.01), (0.1, 0.0)],
+            {"x": 0.5, "y": 0.5, "yaw": 0.0},
+        )
+        self.assertEqual(len(obstacles), 1)
+        self.assertEqual(obstacles[0]["points"], 4)
+        self.assertEqual(obstacles[0]["width"], server.DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE)
+        self.assertGreater(obstacles[0]["x"], 1.4)
+
+    def test_lidar_dynamic_obstacles_ignore_invalid_pose(self) -> None:
+        self.assertEqual(
+            server.lidar_dynamic_obstacle_cells([(1.0, 0.0)] * 4, None), []
+        )
+
     def test_lidar_safety_marks_predicted_collision_without_early_recovery(self) -> None:
         footprint = {"front": 0.15, "back": 0.15, "left": 0.10, "right": 0.10}
         result = server.evaluate_lidar_safety(
