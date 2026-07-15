@@ -171,6 +171,7 @@ function bindElements() {
     "mapEditorSize",
     "mapEditorStatus",
     "cameraFrame",
+    "cameraFpsBadge",
     "cameraStamp",
     "cameraRawButton",
     "cameraCompressedButton",
@@ -661,6 +662,9 @@ function updateCameraUi(runtime = state.data?.runtime || {}) {
   els.cameraCompressedButton.classList.toggle("active", streamMode === "compressed");
   els.cameraRawButton.setAttribute("aria-pressed", String(streamMode === "raw"));
   els.cameraCompressedButton.setAttribute("aria-pressed", String(streamMode === "compressed"));
+  const fps = Number(runtime.cameraFps);
+  els.cameraFpsBadge.textContent = enabled && Number.isFinite(fps) ? `FPS ${fps.toFixed(1)}` : "FPS -";
+  els.cameraFpsBadge.classList.toggle("off", !enabled);
   els.cameraFrame.classList.toggle("camera-off", !enabled);
   els.cameraStamp.textContent = enabled ? runtime.lastCameraAt || "-" : "OFF";
   if (!enabled && els.cameraFrame.dataset.cameraState !== "off") {

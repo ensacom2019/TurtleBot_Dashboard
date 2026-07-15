@@ -13,6 +13,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(server.normalized_camera_stream_mode("Compressed"), "compressed")
         self.assertEqual(server.normalized_camera_stream_mode("invalid"), "compressed")
 
+    def test_camera_frame_rate_uses_received_frame_times(self) -> None:
+        self.assertEqual(server.camera_frame_rate([1.0]), None)
+        self.assertEqual(server.camera_frame_rate([1.0, 1.2, 1.4, 1.6]), 5.0)
+
     def test_default_map_matches_saved_map_setup(self) -> None:
         setup = server.DEFAULT_STATE["setup"]
         self.assertEqual(setup["map"]["imageUrl"], "/data/Sprite-1.png")

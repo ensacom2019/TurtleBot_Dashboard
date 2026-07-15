@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.61"
+APP_VERSION = "2026-07-15.63"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -76,6 +76,15 @@ DEFAULT_TURTLEBOT_RADIUS = 0.114
 
 def normalized_camera_stream_mode(value: Any) -> str:
     return "raw" if str(value or "").lower() == "raw" else "compressed"
+
+
+def camera_frame_rate(timestamps: list[float]) -> Optional[float]:
+    if len(timestamps) < 2:
+        return None
+    elapsed = timestamps[-1] - timestamps[0]
+    if elapsed <= 1e-6:
+        return None
+    return round((len(timestamps) - 1) / elapsed, 1)
 
 
 def topics_for_namespace(namespace: str, camera_style: str = "color") -> Dict[str, str]:
@@ -229,6 +238,7 @@ DEFAULT_STATE: Dict[str, Any] = {
         "navMessage": "",
         "cameraEnabled": True,
         "cameraStream": "compressed",
+        "cameraFps": None,
         "lastCameraAt": None,
         "lastScanAt": None,
         "lastPoseAt": None,
@@ -3023,6 +3033,7 @@ class DashboardState:
         )
         self.camera_bytes: Optional[bytes] = None
         self.camera_content_type = "image/svg+xml"
+        self._camera_frame_times: deque[float] = deque(maxlen=60)
         if detected_server_ip:
             self.save()
 
@@ -3152,6 +3163,8 @@ class DashboardState:
             if not enabled:
                 self.camera_bytes = None
                 self.camera_content_type = "image/svg+xml"
+                self._camera_frame_times.clear()
+                self._state["runtime"]["cameraFps"] = None
             return json.loads(json.dumps(self._state["runtime"]))
 
     def set_camera_stream_mode(self, mode: Any) -> Dict[str, Any]:
@@ -3162,6 +3175,8 @@ class DashboardState:
             self.camera_bytes = None
             self.camera_content_type = "image/svg+xml"
             runtime["lastCameraAt"] = None
+            runtime["cameraFps"] = None
+            self._camera_frame_times.clear()
             return json.loads(json.dumps(runtime))
 
     def camera_enabled(self) -> bool:
@@ -3185,7 +3200,12 @@ class DashboardState:
                 return
             self.camera_bytes = content
             self.camera_content_type = content_type
-            self._state["runtime"]["lastCameraAt"] = now_iso()
+            received = time.monotonic()
+            self._camera_frame_times.append(received)
+            while self._camera_frame_times and received - self._camera_frame_times[0] > 2.0:
+                self._camera_frame_times.popleft()
+            runtime["lastCameraAt"] = now_iso()
+            runtime["cameraFps"] = camera_frame_rate(list(self._camera_frame_times))
 
     def get_camera(self) -> Tuple[bytes, str]:
         with self._lock:
