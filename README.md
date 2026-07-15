@@ -10,11 +10,17 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 
 ![TurtleBot Dashboard setup screen](docs/images/dashboard-overview.png)
 
-### 기본 맵 도면
+### 주행 대시보드
 
-기본 맵의 벽 배치는 아래 도면을 기준으로 하며, 대시보드의 `맵 제작` 탭에서 직접 수정하거나 새 맵으로 저장할 수 있습니다.
+카메라 영상과 FPS, 지도 위 로봇 위치, 계획 경로와 LiDAR 점을 함께 확인합니다. 우측 패널에서 수동 운전, 목표 및 경유지 지정, 반복 운행, A* 직접 주행을 제어하고 주행 로그를 수집할 수 있습니다.
 
-![Default TurtleBot map](data/Sprite-1.png)
+![TurtleBot Dashboard drive screen](docs/images/dashboard-drive.png)
+
+### 맵 제작 대시보드
+
+맵의 실제 크기와 `1픽셀당 cm` 비율로 그리드를 생성합니다. 펜과 지우개로 벽을 편집하고, 마우스 휠 확대·축소와 `Shift + 드래그` 이동을 사용해 큰 맵도 다룰 수 있습니다. 완성된 맵은 내부 맵 폴더에 저장한 뒤 셋업 화면에서 선택합니다.
+
+![TurtleBot Dashboard map editor](docs/images/dashboard-map-editor.png)
 
 ## 주요 기능
 
