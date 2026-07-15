@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 
@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.59"
+APP_VERSION = "2026-07-15.60"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -55,13 +55,14 @@ FALLBACK_LIDAR_COAST_MIN_CLEARANCE = 0.12
 FALLBACK_LIDAR_COAST_MAX_ANGULAR = 0.25
 FALLBACK_REPLAN_RECOVERY_SECONDS = 3.0
 FALLBACK_REPLAN_RECOVERY_ATTEMPTS = 5
-FALLBACK_DYNAMIC_REPLAN_LOOKAHEAD = 0.45
+FALLBACK_DYNAMIC_REPLAN_LOOKAHEAD = 0.20
 FALLBACK_DYNAMIC_REPLAN_COOLDOWN = 1.5
 DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE = 0.08
 DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS = 5
 DYNAMIC_LIDAR_OBSTACLE_HOLD_SECONDS = 1.0
 DYNAMIC_LIDAR_OBSTACLE_MIN_RANGE = 0.18
 DYNAMIC_LIDAR_OBSTACLE_MAX_RANGE = 2.5
+DYNAMIC_LIDAR_STATIC_WALL_TOLERANCE = 0.02
 NANOSECONDS_PER_SECOND = 1_000_000_000
 ROBOT_CLOCK_FRESH_SECONDS = 2.0
 MAX_JSON_BODY_BYTES = 24 * 1024 * 1024
@@ -541,6 +542,7 @@ def lidar_dynamic_obstacle_cells(
     pose: Optional[Dict[str, Any]],
     cell_size: float = DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE,
     min_points: int = DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS,
+    static_wall_match: Optional[Callable[[float, float], bool]] = None,
 ) -> list[Dict[str, Any]]:
     """Return dense LiDAR cells in map coordinates for short-lived obstacles."""
     if not pose or cell_size <= 0.0 or min_points < 1:
@@ -563,6 +565,8 @@ def lidar_dynamic_obstacle_cells(
             continue
         world_x = pose_x + cos_yaw * local_x - sin_yaw * local_y
         world_y = pose_y + sin_yaw * local_x + cos_yaw * local_y
+        if static_wall_match is not None and static_wall_match(world_x, world_y):
+            continue
         key = (math.floor(world_x / cell_size), math.floor(world_y / cell_size))
         counts[key] = counts.get(key, 0) + 1
 
@@ -1613,6 +1617,34 @@ def load_map_gray(path: Path) -> Tuple[int, int, bytearray]:
     if suffix == ".pgm":
         return decode_pgm_gray(path)
     raise ValueError(f"unsupported map image type: {suffix or path.name}")
+
+
+def static_map_wall_near(
+    map_data: Dict[str, Any], x: float, y: float,
+    tolerance: float = DYNAMIC_LIDAR_STATIC_WALL_TOLERANCE,
+) -> bool:
+    """Return whether a world-space LiDAR point is on a known occupied map area."""
+    try:
+        width = int(map_data["width"])
+        height = int(map_data["height"])
+        pixels = map_data["pixels"]
+        resolution = float(map_data["resolution"])
+        origin_x = float(map_data["originX"])
+        origin_y = float(map_data["originY"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0 or resolution <= 0.0:
+        return False
+    min_grid_x = math.floor((x - tolerance - origin_x) / resolution)
+    max_grid_x = math.floor((x + tolerance - origin_x) / resolution)
+    min_grid_y = math.floor((y - tolerance - origin_y) / resolution)
+    max_grid_y = math.floor((y + tolerance - origin_y) / resolution)
+    for grid_y in range(max(0, min_grid_y), min(height - 1, max_grid_y) + 1):
+        pixel_y = height - 1 - grid_y
+        for grid_x in range(max(0, min_grid_x), min(width - 1, max_grid_x) + 1):
+            if pixels[pixel_y * width + grid_x] < 80:
+                return True
+    return False
 
 
 def paint_world_rect(
@@ -3789,6 +3821,7 @@ class RosBridge:
         self._last_lidar_display = 0.0
         self._last_sensor_run_log = 0.0
         self._dynamic_lidar_obstacle_tracks: Dict[str, Dict[str, Any]] = {}
+        self._static_wall_map_cache: Dict[str, Any] = {}
         self._last_logged_manual_command: Optional[Tuple[float, float]] = None
         self._spin_thread: Optional[threading.Thread] = None
         self._publisher_lock = threading.RLock()
@@ -4032,15 +4065,71 @@ class RosBridge:
             }
         )
 
+    def _static_wall_map_for_setup(self, setup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        map_config = setup.get("map", {}) or {}
+        planner = setup.get("planner", {}) or {}
+        source = configured_map_path(map_config)
+        source_state: Dict[str, Any] = {}
+        if source is not None:
+            try:
+                stat = source.stat()
+                source_state = {"path": str(source), "size": stat.st_size, "mtime": stat.st_mtime_ns}
+            except OSError:
+                source_state = {"path": str(source), "missing": True}
+        signature = json.dumps(
+            {
+                "source": source_state,
+                "map": {
+                    key: map_config.get(key)
+                    for key in ("imageUrl", "resolution", "originX", "originY")
+                },
+                "blockedCells": planner.get("blockedCells", []),
+                "freeCells": planner.get("freeCells", []),
+                "obstacles": setup.get("obstacles", []),
+                "objectInflation": (setup.get("object", {}) or {}).get("inflation", 0.0),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        if self._static_wall_map_cache.get("signature") == signature:
+            return self._static_wall_map_cache.get("mapData")
+
+        map_data: Optional[Dict[str, Any]] = None
+        try:
+            if source is None or not source.exists():
+                raise FileNotFoundError("configured map image is unavailable")
+            width, height, pixels = load_map_gray(source)
+            apply_setup_overlays_to_map(pixels, width, height, setup)
+            map_data = {
+                "width": width,
+                "height": height,
+                "pixels": pixels,
+                "resolution": float(map_config.get("resolution") or 0.05),
+                "originX": float(map_config.get("originX") or 0.0),
+                "originY": float(map_config.get("originY") or 0.0),
+            }
+        except (OSError, TypeError, ValueError):
+            map_data = None
+        self._static_wall_map_cache = {"signature": signature, "mapData": map_data}
+        return map_data
+
+    def _static_wall_matcher(self, setup: Dict[str, Any]) -> Optional[Callable[[float, float], bool]]:
+        map_data = self._static_wall_map_for_setup(setup)
+        if map_data is None:
+            return None
+        return lambda x, y: static_map_wall_near(map_data, x, y)
+
     def _update_dynamic_lidar_obstacles(
         self, points: list[Tuple[float, float]], pose: Optional[Dict[str, Any]], received: float
     ) -> list[Dict[str, Any]]:
-        planner = self.state.get_setup().get("planner", {}) or {}
+        setup = self.state.get_setup()
+        planner = setup.get("planner", {}) or {}
         if not bool(planner.get("detectLidarObstacles", True)):
             self._dynamic_lidar_obstacle_tracks.clear()
             return []
 
-        for obstacle in lidar_dynamic_obstacle_cells(points, pose):
+        static_wall_match = self._static_wall_matcher(setup)
+        for obstacle in lidar_dynamic_obstacle_cells(points, pose, static_wall_match=static_wall_match):
             track = dict(obstacle)
             track["lastSeen"] = received
             self._dynamic_lidar_obstacle_tracks[track["id"]] = track

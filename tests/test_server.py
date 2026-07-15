@@ -237,6 +237,28 @@ class ServerHelpersTest(unittest.TestCase):
             ),
             [],
         )
+        self.assertEqual(
+            server.lidar_dynamic_obstacle_cells(
+                [(1.00, 0.01), (1.01, 0.02), (1.015, 0.03), (1.018, 0.01), (1.017, 0.02)],
+                {"x": 0.5, "y": 0.5, "yaw": 0.0},
+                static_wall_match=lambda _x, _y: True,
+            ),
+            [],
+        )
+
+    def test_static_map_wall_match_allows_two_centimeter_lidar_error(self) -> None:
+        pixels = bytearray([255]) * 10_000
+        pixels[49 * 100 + 50] = 0
+        map_data = {
+            "width": 100,
+            "height": 100,
+            "pixels": pixels,
+            "resolution": 0.01,
+            "originX": 0.0,
+            "originY": 0.0,
+        }
+        self.assertTrue(server.static_map_wall_near(map_data, 0.525, 0.505))
+        self.assertFalse(server.static_map_wall_near(map_data, 0.535, 0.505))
 
     def test_lidar_dynamic_obstacles_ignore_invalid_pose(self) -> None:
         self.assertEqual(
@@ -285,7 +307,7 @@ class ServerHelpersTest(unittest.TestCase):
                 path,
                 0,
                 pose,
-                [{"x": 0.25, "y": 0.0, "width": 0.08, "height": 0.08}],
+                [{"x": 0.15, "y": 0.0, "width": 0.08, "height": 0.08}],
             )
         )
         self.assertFalse(
