@@ -125,6 +125,10 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertIn("tb3_base tb3_nav2 tb3_camera", script)
         self.assertIn("/cmd_vel", script)
+        self.assertIn("dashboard bringup stop verification", script)
+        self.assertIn("[s]ingle_coin_d4_node", script)
+        self.assertIn("/scan still has publishers", script)
+        self.assertIn("exit 22", script)
 
     def test_server_ip_prefers_robot_subnet(self) -> None:
         selected = server.select_server_ip(

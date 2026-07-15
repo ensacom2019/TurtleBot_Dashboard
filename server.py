@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.63"
+APP_VERSION = "2026-07-15.64"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -2645,10 +2645,44 @@ timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/TwistStamped "{
 for session in tb3_base tb3_nav2 tb3_camera; do
   tmux kill-session -t "$session" >/dev/null 2>&1 && echo "[STOP] tmux $session" || true
 done
-pkill -f "[t]urtlebot3_ros.*" >/dev/null 2>&1 && echo "[STOP] turtlebot3 base" || true
+pkill -f "[r]os2 launch turtlebot3_bringup robot.launch.py|[t]urtlebot3_ros.*|[t]urtlebot3_node|[s]ingle_coin_d4_node|[r]obot_state_publisher" >/dev/null 2>&1 && echo "[STOP] turtlebot3 base" || true
 pkill -f "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[b]ehavior_server|[c]ollision_monitor|[l]ifecycle_manager_navigation|[t]urtlebot3_navigation2|[n]av2_bringup" >/dev/null 2>&1 && echo "[STOP] nav2" || true
 pkill -f "[c]amera_ros|[c]amera_node|[r]ealsense2_camera|[u]sb_cam|[v]4l2_camera" >/dev/null 2>&1 && echo "[STOP] camera" || true
-echo "[OK] dashboard bringup stop request completed"
+sleep 2
+
+echo "== dashboard bringup stop verification =="
+remaining=0
+for session in tb3_base tb3_nav2 tb3_camera; do
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo "[FAIL] tmux session still active: $session"
+    remaining=1
+  else
+    echo "[OK] tmux session stopped: $session"
+  fi
+done
+base_processes="$(pgrep -af '[r]os2 launch turtlebot3_bringup robot.launch.py|[t]urtlebot3_ros.*|[t]urtlebot3_node|[s]ingle_coin_d4_node|[r]obot_state_publisher' || true)"
+if [ -n "$base_processes" ]; then
+  echo "[FAIL] TurtleBot base processes still active:"
+  echo "$base_processes"
+  remaining=1
+else
+  echo "[OK] TurtleBot base processes stopped"
+fi
+scan_info="$(timeout -k 1 4 ros2 topic info {cmd_vel} -v 2>/dev/null || true)"
+cmd_subscribers="$(printf '%s\n' "$scan_info" | sed -n 's/^Subscription count: *//p' | head -1)"
+echo "[INFO] {cmd_vel} subscribers after stop: ${{cmd_subscribers:-unknown}}"
+scan_info="$(timeout -k 1 4 ros2 topic info /scan -v 2>/dev/null || true)"
+scan_publishers="$(printf '%s\n' "$scan_info" | sed -n 's/^Publisher count: *//p' | head -1)"
+echo "[INFO] /scan publishers after stop: ${{scan_publishers:-unknown}}"
+if [ -n "$scan_publishers" ] && [ "$scan_publishers" != "0" ]; then
+  echo "[FAIL] /scan still has publishers"
+  remaining=1
+fi
+if [ "$remaining" -ne 0 ]; then
+  echo "[FAIL] dashboard bringup stop verification failed"
+  exit 22
+fi
+echo "[OK] dashboard bringup stopped and verified"
 """
 
 
@@ -2663,7 +2697,11 @@ def run_robot_bringup_stop_from_state(state: "DashboardState") -> Dict[str, Any]
     state.update_runtime(
         {
             "navStatus": "robot_bringup_stopped" if result.get("ok") else "robot_bringup_stop_failed",
-            "navMessage": "Robot bringup stop request completed." if result.get("ok") else "Robot bringup stop failed.",
+            "navMessage": (
+                "Robot bringup stopped and verified."
+                if result.get("ok")
+                else "Robot bringup stop verification failed."
+            ),
             "lastRobotBringupStopAt": started_at,
         }
     )
