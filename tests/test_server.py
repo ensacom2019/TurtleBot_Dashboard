@@ -119,15 +119,30 @@ class ServerHelpersTest(unittest.TestCase):
     def test_editor_maps_are_saved_under_the_internal_maps_folder(self) -> None:
         self.assertEqual(server.MAP_DATA_ROOT, server.DATA_ROOT / "maps")
 
-    def test_robot_bringup_stop_script_targets_dashboard_sessions(self) -> None:
-        script = server.build_robot_bringup_stop_script(
-            {"rosDomainId": "1", "rosLocalhostOnly": "0"}, {"cmdVel": "/cmd_vel"}
+    def test_robot_bringup_script_uses_a_systemd_cgroup_for_base(self) -> None:
+        script = server.build_robot_bringup_script(
+            {"rosDomainId": "1", "rosLocalhostOnly": "0"}
         )
-        self.assertIn("tb3_base tb3_nav2 tb3_camera", script)
-        self.assertIn("/cmd_vel", script)
+        self.assertIn('BASE_SERVICE="turtlebot-dashboard-base.service"', script)
+        self.assertIn("systemctl --user start", script)
+        self.assertIn("KillMode=control-group", script)
+        self.assertIn("KillSignal=SIGINT", script)
+        self.assertIn("loginctl show-user", script)
+        self.assertNotIn("start_detached tb3_base", script)
+
+    def test_robot_bringup_stop_script_stops_the_systemd_base_service(self) -> None:
+        script = server.build_robot_bringup_stop_script(
+            {"rosDomainId": "1", "rosLocalhostOnly": "0"},
+            {"cmdVel": "/tb3_2/cmd_vel", "scan": "/tb3_2/scan"},
+        )
+        self.assertIn('BASE_SERVICE="turtlebot-dashboard-base.service"', script)
+        self.assertIn('systemctl --user stop "$BASE_SERVICE"', script)
+        self.assertIn("tmux send-keys -t tb3_base C-c", script)
+        self.assertIn("/tb3_2/cmd_vel", script)
+        self.assertIn("/tb3_2/scan", script)
         self.assertIn("dashboard bringup stop verification", script)
-        self.assertIn("[s]ingle_coin_d4_node", script)
-        self.assertIn("/scan still has publishers", script)
+        self.assertIn("systemd service stopped", script)
+        self.assertNotIn('pkill -f "[r]os2 launch turtlebot3_bringup', script)
         self.assertIn("exit 22", script)
 
     def test_server_ip_prefers_robot_subnet(self) -> None:
@@ -693,7 +708,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertLess(script.index("/dev/ttyACM1"), script.index("/dev/ttyACM0"))
         self.assertIn("is_opencr_port", script)
         self.assertIn("Arduino|Uno", script)
-        self.assertIn("usb_port:=$OPENCR_PORT", script)
+        self.assertIn("usb_port:=$opencr_port", script)
+        self.assertIn("turtlebot-dashboard-base.service", script)
         self.assertIn("turtlebot3_node did not become ready", script)
         self.assertIn("Refusing to launch turtlebot3_node", script)
 

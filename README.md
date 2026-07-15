@@ -28,8 +28,8 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 - LiDAR 점 표시와 본체 외곽 거리 기반 감속/회피
 - 카메라 화면, 수동 주행, 주행 로그, 진단 보고서
 - ROS 2 토픽 설정, 로봇 탭 선택, 같은 사설 네트워크의 SSH 장비 및 ROS 로봇 검색, 로봇 체크
-- SSH 브링업: OpenCR 포트 검증 후 TurtleBot base, Nav2/AMCL, 카메라 실행
-- SSH 브링업 종료: 정지 명령 전송 후 대시보드가 시작한 base/Nav2/camera 프로세스 종료
+- SSH 브링업: OpenCR 포트 검증 후 systemd 사용자 서비스로 TurtleBot base를 실행하고 Nav2/AMCL, 카메라를 시작
+- SSH 브링업 종료: base 서비스 cgroup에 SIGINT를 보내 LiDAR를 포함한 자식 프로세스를 정상 종료
 
 ## 요구 사항
 
@@ -109,11 +109,19 @@ python server.py --host 127.0.0.1 --port 8080
 셋업 탭에 로봇 IP, SSH 계정, ROS domain을 입력한 뒤 `로봇 브링업`을 누르면 다음을 시도합니다.
 
 - `/dev/ttyACM1`, `/dev/ttyACM0`에서 OpenCR 식별 및 Arduino Uno 제외
-- TurtleBot3 base bringup
+- `turtlebot-dashboard-base.service` 사용자 서비스로 TurtleBot3 base bringup
 - 현재 선택한 대시보드 맵을 ROS map 파일로 전송
 - Nav2/AMCL과 카메라 bringup
 
-`브링업 종료`는 먼저 정지 명령을 보내고 `tb3_base`, `tb3_nav2`, `tb3_camera` 세션과 관련 프로세스를 종료합니다.
+처음 한 번 로봇에서 아래 명령을 실행해 SSH 사용자의 systemd 서비스를 로그인 종료 후에도 유지해야 합니다.
+
+```bash
+sudo loginctl enable-linger kim
+```
+
+`브링업 종료`는 먼저 정지 명령을 보내고 `systemctl --user stop turtlebot-dashboard-base.service`로 base 서비스 cgroup 전체에 `SIGINT`를 전달합니다. 따라서 `ros2 launch`의 LiDAR 드라이버 자식 프로세스도 `Ctrl+C`와 같은 순서로 종료됩니다. Nav2와 카메라 세션도 함께 종료합니다.
+
+직접 SSH 터미널에서 실행한 기존 `ros2 launch`는 대시보드가 소유하지 않으므로 자동 종료하지 않습니다. 한 번 `Ctrl+C`로 종료한 뒤 대시보드 브링업으로 전환하세요.
 
 ## 검증
 

@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.67"
+APP_VERSION = "2026-07-15.68"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -2149,6 +2149,71 @@ start_detached() {{
   echo "[LOG] $log"
 }}
 
+BASE_SERVICE="turtlebot-dashboard-base.service"
+
+start_base_service() {{
+  local opencr_port="$1"
+  local unit_dir="$HOME/.config/systemd/user"
+  local unit_file="$unit_dir/$BASE_SERVICE"
+  local base_script="$LOG_DIR/tb3_base.sh"
+  local base_log="$LOG_DIR/tb3_base.log"
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "[FAIL] systemd user manager is unavailable for $USER."
+    echo "[FIX] Log in as this robot user and make systemctl --user available before dashboard bringup."
+    return 13
+  fi
+  local linger
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
+  if [ "$linger" != "yes" ]; then
+    echo "[FAIL] systemd user lingering is disabled for $USER."
+    echo "[FIX] Run once on the robot: sudo loginctl enable-linger $USER"
+    return 14
+  fi
+  mkdir -p "$unit_dir"
+  cat > "$base_script" <<BASE_SCRIPT
+#!/usr/bin/env bash
+set -e
+source /opt/ros/jazzy/setup.bash
+[ -f "$HOME/turtlebot3_ws/install/setup.bash" ] && source "$HOME/turtlebot3_ws/install/setup.bash"
+export ROS_DOMAIN_ID={domain}
+export ROS_LOCALHOST_ONLY={localhost_only}
+export RMW_IMPLEMENTATION="${{RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}}"
+export ROS_AUTOMATIC_DISCOVERY_RANGE="${{ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}}"
+export ROS2CLI_NO_DAEMON=1
+export TURTLEBOT3_MODEL="${{TURTLEBOT3_MODEL:-burger}}"
+export LDS_MODEL="${{LDS_MODEL:-LDS-03}}"
+exec ros2 launch turtlebot3_bringup robot.launch.py usb_port:=$opencr_port
+BASE_SCRIPT
+  chmod +x "$base_script"
+  cat > "$unit_file" <<BASE_UNIT
+[Unit]
+Description=TurtleBot Dashboard base bringup
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $base_script
+Restart=no
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=12
+SendSIGKILL=yes
+StandardOutput=append:$base_log
+StandardError=append:$base_log
+BASE_UNIT
+  systemctl --user daemon-reload || return 13
+  systemctl --user stop "$BASE_SERVICE" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$BASE_SERVICE" >/dev/null 2>&1 || true
+  systemctl --user start "$BASE_SERVICE" || return 15
+  if systemctl --user is-active --quiet "$BASE_SERVICE"; then
+    echo "[START] $BASE_SERVICE via systemd user service"
+    echo "[LOG] $base_log"
+    return 0
+  fi
+  echo "[FAIL] $BASE_SERVICE did not become active"
+  systemctl --user status "$BASE_SERVICE" --no-pager -l 2>&1 || true
+  return 15
+}}
+
 echo "== dashboard robot bringup =="
 echo "host: $(hostname)"
 echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID ROS_LOCALHOST_ONLY=$ROS_LOCALHOST_ONLY RMW=$RMW_IMPLEMENTATION"
@@ -2186,32 +2251,46 @@ if [ -z "$OPENCR_PORT" ]; then
   echo "[FAIL] No verified ROBOTIS OpenCR found on /dev/ttyACM1 or /dev/ttyACM0."
   echo "[FAIL] Refusing to launch turtlebot3_node against Arduino Uno or an unknown serial device."
   BRINGUP_FAIL=11
-elif process_running "[t]urtlebot3_ros.*-i $OPENCR_PORT"; then
+elif systemctl --user is-active --quiet "$BASE_SERVICE"; then
   if timeout -k 1 3 ros2 node list 2>/dev/null | grep -Eq '(^|/)turtlebot3_node$'; then
-    echo "[OK] OpenCR handshake verified: turtlebot3_node is already alive on $OPENCR_PORT"
+    echo "[OK] $BASE_SERVICE is active and turtlebot3_node is alive on $OPENCR_PORT"
   else
-    echo "[FAIL] turtlebot3_ros process exists on $OPENCR_PORT but turtlebot3_node is absent from the ROS graph"
+    echo "[FAIL] $BASE_SERVICE is active but turtlebot3_node is absent from the ROS graph"
     BRINGUP_FAIL=12
   fi
+elif process_running "[t]urtlebot3_ros.*-i $OPENCR_PORT"; then
+  echo "[FAIL] TurtleBot base is already running outside $BASE_SERVICE."
+  echo "[FIX] Stop the manually started ros2 launch once, then start it from the dashboard."
+  BRINGUP_FAIL=16
 else
-  start_detached tb3_base "ros2 launch turtlebot3_bringup robot.launch.py usb_port:=$OPENCR_PORT"
-  echo "[INFO] base bringup start requested with verified port $OPENCR_PORT"
-  BASE_READY=0
-  for attempt in $(seq 1 12); do
-    if process_running "[t]urtlebot3_ros.*-i $OPENCR_PORT" && timeout -k 1 3 ros2 node list 2>/dev/null | grep -Eq '(^|/)turtlebot3_node$'; then
-      BASE_READY=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$BASE_READY" = "1" ]; then
-    echo "[OK] OpenCR handshake verified: turtlebot3_node is alive on $OPENCR_PORT"
+  start_base_service "$OPENCR_PORT"
+  base_start_code=$?
+  if [ "$base_start_code" -ne 0 ]; then
+    BRINGUP_FAIL="$base_start_code"
   else
-    echo "[FAIL] turtlebot3_node did not become ready on verified OpenCR port $OPENCR_PORT"
-    echo "[INFO] recent base log:"
-    tail -60 "$LOG_DIR/tb3_base.log" 2>/dev/null || true
-    BRINGUP_FAIL=12
+    echo "[INFO] base bringup start requested with verified port $OPENCR_PORT via $BASE_SERVICE"
+    BASE_READY=0
+    for attempt in $(seq 1 12); do
+      if process_running "[t]urtlebot3_ros.*-i $OPENCR_PORT" && timeout -k 1 3 ros2 node list 2>/dev/null | grep -Eq '(^|/)turtlebot3_node$'; then
+        BASE_READY=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$BASE_READY" = "1" ]; then
+      echo "[OK] OpenCR handshake verified: turtlebot3_node is alive on $OPENCR_PORT"
+    else
+      echo "[FAIL] turtlebot3_node did not become ready on verified OpenCR port $OPENCR_PORT"
+      echo "[INFO] recent base log:"
+      tail -60 "$LOG_DIR/tb3_base.log" 2>/dev/null || true
+      BRINGUP_FAIL=12
+    fi
   fi
+fi
+
+if [ "$BRINGUP_FAIL" -ne 0 ]; then
+  echo "[FAIL] Base bringup failed; Nav2 and camera startup were skipped."
+  exit "$BRINGUP_FAIL"
 fi
 
 echo
@@ -2265,6 +2344,8 @@ fi
 echo
 echo "== async sessions =="
 tmux ls 2>/dev/null || true
+echo "== systemd base service =="
+systemctl --user status "$BASE_SERVICE" --no-pager -l 2>&1 || true
 echo
 for f in "$LOG_DIR"/tb3_base.log "$LOG_DIR"/tb3_nav2.log "$LOG_DIR"/tb3_camera.log "$LOG_DIR"/tb3_base.sh "$LOG_DIR"/tb3_nav2.sh "$LOG_DIR"/tb3_camera.sh; do
   [ -e "$f" ] || continue
@@ -2410,6 +2491,7 @@ run 'for d in /dev/ttyACM* /dev/ttyUSB*; do [ -e "$d" ] || continue; echo "-- $d
 run 'ls -l "$HOME/maps/dashboard" "$HOME/maps" 2>/dev/null || true'
 run 'sed -n "1,80p" "$HOME/maps/dashboard/dashboard_map.yaml" 2>/dev/null || true'
 run 'for s in tb3_base tb3_nav2 tb3_camera bringup ros_tcp slam camera nav2; do if tmux has-session -t "$s" 2>/dev/null; then echo "== tmux $s =="; tmux capture-pane -pt "$s" -S -140 2>/dev/null || true; fi; done'
+run 'loginctl show-user "$USER" -p Linger 2>&1 || true; systemctl --user status turtlebot-dashboard-base.service --no-pager -l 2>&1 || true'
 run 'for f in "$HOME"/turtlebot_dashboard_logs/*.log "$HOME"/turtlebot_dashboard_logs/*.sh; do [ -e "$f" ] || continue; echo "== $f =="; tail -100 "$f" 2>/dev/null || true; done'
 run 'for pkg in turtlebot3_bringup turtlebot3_navigation2 nav2_bringup camera_ros realsense2_camera; do echo "-- $pkg"; ros2 pkg prefix "$pkg" 2>&1 || true; done'
 
@@ -2727,6 +2809,7 @@ def build_robot_bringup_stop_script(network: Dict[str, Any], topics: Dict[str, A
     domain = shlex.quote(str(network.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or "1"))
     localhost_only = shlex.quote(str(network.get("rosLocalhostOnly") or "0"))
     cmd_vel = shlex.quote(str(topics.get("cmdVel") or "/cmd_vel"))
+    scan = shlex.quote(str(topics.get("scan") or "/scan"))
     return f"""#!/usr/bin/env bash
 set +e
 source /opt/ros/jazzy/setup.bash 2>/dev/null || true
@@ -2734,21 +2817,49 @@ source /opt/ros/jazzy/setup.bash 2>/dev/null || true
 export ROS_DOMAIN_ID={domain}
 export ROS_LOCALHOST_ONLY={localhost_only}
 export ROS2CLI_NO_DAEMON=1
+BASE_SERVICE="turtlebot-dashboard-base.service"
+remaining=0
 
 echo "== dashboard robot bringup stop =="
 timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/Twist "{{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}" >/dev/null 2>&1 || true
 timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/TwistStamped "{{twist: {{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}}}" >/dev/null 2>&1 || true
-for session in tb3_base tb3_nav2 tb3_camera; do
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+  echo "[FAIL] systemd user manager is unavailable; base service stop cannot be verified."
+  remaining=1
+elif systemctl --user is-active --quiet "$BASE_SERVICE"; then
+  systemctl --user stop "$BASE_SERVICE"
+  echo "[STOP] systemd $BASE_SERVICE"
+else
+  echo "[INFO] $BASE_SERVICE is not active"
+fi
+
+# Compatibility cleanup for an older dashboard-managed tmux base session.
+# A manually launched terminal session is intentionally not targeted here.
+if tmux has-session -t tb3_base 2>/dev/null; then
+  tmux send-keys -t tb3_base C-c >/dev/null 2>&1 || true
+  sleep 3
+  tmux kill-session -t tb3_base >/dev/null 2>&1 || true
+  echo "[STOP] legacy tmux tb3_base"
+fi
+for session in tb3_nav2 tb3_camera; do
   tmux kill-session -t "$session" >/dev/null 2>&1 && echo "[STOP] tmux $session" || true
 done
-pkill -f "[r]os2 launch turtlebot3_bringup robot.launch.py|[t]urtlebot3_ros.*|[t]urtlebot3_node|[s]ingle_coin_d4_node|[r]obot_state_publisher" >/dev/null 2>&1 && echo "[STOP] turtlebot3 base" || true
 pkill -f "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[b]ehavior_server|[c]ollision_monitor|[l]ifecycle_manager_navigation|[t]urtlebot3_navigation2|[n]av2_bringup" >/dev/null 2>&1 && echo "[STOP] nav2" || true
 pkill -f "[c]amera_ros|[c]amera_node|[r]ealsense2_camera|[u]sb_cam|[v]4l2_camera" >/dev/null 2>&1 && echo "[STOP] camera" || true
 sleep 2
 
 echo "== dashboard bringup stop verification =="
-remaining=0
-for session in tb3_base tb3_nav2 tb3_camera; do
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+  echo "[FAIL] systemd user manager is unavailable during verification"
+  remaining=1
+elif systemctl --user is-active --quiet "$BASE_SERVICE"; then
+  echo "[FAIL] systemd service still active: $BASE_SERVICE"
+  systemctl --user status "$BASE_SERVICE" --no-pager -l 2>&1 || true
+  remaining=1
+else
+  echo "[OK] systemd service stopped: $BASE_SERVICE"
+fi
+for session in tb3_nav2 tb3_camera; do
   if tmux has-session -t "$session" 2>/dev/null; then
     echo "[FAIL] tmux session still active: $session"
     remaining=1
@@ -2756,22 +2867,14 @@ for session in tb3_base tb3_nav2 tb3_camera; do
     echo "[OK] tmux session stopped: $session"
   fi
 done
-base_processes="$(pgrep -af '[r]os2 launch turtlebot3_bringup robot.launch.py|[t]urtlebot3_ros.*|[t]urtlebot3_node|[s]ingle_coin_d4_node|[r]obot_state_publisher' || true)"
-if [ -n "$base_processes" ]; then
-  echo "[FAIL] TurtleBot base processes still active:"
-  echo "$base_processes"
-  remaining=1
-else
-  echo "[OK] TurtleBot base processes stopped"
-fi
 scan_info="$(timeout -k 1 4 ros2 topic info {cmd_vel} -v 2>/dev/null || true)"
 cmd_subscribers="$(printf '%s\n' "$scan_info" | sed -n 's/^Subscription count: *//p' | head -1)"
 echo "[INFO] {cmd_vel} subscribers after stop: ${{cmd_subscribers:-unknown}}"
-scan_info="$(timeout -k 1 4 ros2 topic info /scan -v 2>/dev/null || true)"
+scan_info="$(timeout -k 1 4 ros2 topic info {scan} -v 2>/dev/null || true)"
 scan_publishers="$(printf '%s\n' "$scan_info" | sed -n 's/^Publisher count: *//p' | head -1)"
-echo "[INFO] /scan publishers after stop: ${{scan_publishers:-unknown}}"
+echo "[INFO] {scan} publishers after stop: ${{scan_publishers:-unknown}}"
 if [ -n "$scan_publishers" ] && [ "$scan_publishers" != "0" ]; then
-  echo "[FAIL] /scan still has publishers"
+  echo "[FAIL] {scan} still has publishers. It may be a manually started or external LiDAR driver."
   remaining=1
 fi
 if [ "$remaining" -ne 0 ]; then
