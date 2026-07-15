@@ -4,6 +4,7 @@ import base64
 import binascii
 import concurrent.futures
 import gzip
+import heapq
 import ipaddress
 import json
 import math
@@ -35,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-14.56"
+APP_VERSION = "2026-07-15.57"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -45,13 +46,15 @@ FALLBACK_RECOVERY_FORWARD_SECONDS = 0.5
 FALLBACK_RECOVERY_TURN_SPEED = 0.35
 FALLBACK_RECOVERY_REVERSE_SPEED = 0.02
 FALLBACK_RECOVERY_FORWARD_SPEED = 0.025
-FALLBACK_RECOVERY_MAX_ATTEMPTS = 4
+FALLBACK_RECOVERY_MAX_ATTEMPTS = 5
 FALLBACK_RECOVERY_ESCAPE_MIN_IMPROVEMENT = 0.002
 FALLBACK_RECOVERY_ESCAPE_MAX_WORSENING = 0.003
 FALLBACK_RECOVERY_TRAPPED_RETRY_SECONDS = 0.75
 FALLBACK_LIDAR_COAST_SECONDS = 0.8
 FALLBACK_LIDAR_COAST_MIN_CLEARANCE = 0.12
 FALLBACK_LIDAR_COAST_MAX_ANGULAR = 0.25
+FALLBACK_REPLAN_RECOVERY_SECONDS = 3.0
+FALLBACK_REPLAN_RECOVERY_ATTEMPTS = 5
 DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE = 0.08
 DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS = 4
 DYNAMIC_LIDAR_OBSTACLE_HOLD_SECONDS = 1.0
@@ -626,6 +629,16 @@ def lidar_coast_command(command: Dict[str, Any], settings: Dict[str, Any]) -> Tu
         )
     angular_limit = min(float(settings["maxAngular"]), FALLBACK_LIDAR_COAST_MAX_ANGULAR)
     return linear, clamp(requested_angular, -angular_limit, angular_limit)
+
+
+def fallback_replan_due(
+    recovery_started_at: Optional[float], attempts: int, now: float, last_replan_at: float
+) -> bool:
+    if recovery_started_at is None:
+        return False
+    persisted = now - recovery_started_at >= FALLBACK_REPLAN_RECOVERY_SECONDS
+    exhausted = attempts >= FALLBACK_REPLAN_RECOVERY_ATTEMPTS
+    return (persisted or exhausted) and now - last_replan_at >= FALLBACK_REPLAN_RECOVERY_SECONDS
 
 
 def choose_lidar_recovery_turn(points: list[Tuple[float, float]]) -> int:
@@ -1564,6 +1577,184 @@ def build_dashboard_map_package(setup: Dict[str, Any]) -> Dict[str, Any]:
         "yaml": yaml_text,
         "pgmGzipBase64": base64.b64encode(gzip.compress(pgm, compresslevel=9)).decode("ascii"),
     }
+
+
+def fallback_grid_metrics(setup: Dict[str, Any], width: int, height: int) -> Dict[str, Any]:
+    map_config = setup.get("map", {}) or {}
+    planner = setup.get("planner", {}) or {}
+    resolution = max(0.0001, float(map_config.get("resolution") or 0.05))
+    cell_size = max(0.005, float(planner.get("cellSize") or 0.02))
+    return {
+        "resolution": resolution,
+        "cellSize": cell_size,
+        "originX": float(map_config.get("originX") or 0.0),
+        "originY": float(map_config.get("originY") or 0.0),
+        "cols": max(1, math.ceil(width * resolution / cell_size)),
+        "rows": max(1, math.ceil(height * resolution / cell_size)),
+    }
+
+
+def fallback_world_to_cell(
+    x: float, y: float, metrics: Dict[str, Any]
+) -> Optional[Tuple[int, int]]:
+    cell_x = math.floor((x - float(metrics["originX"])) / float(metrics["cellSize"]))
+    cell_y = math.floor((y - float(metrics["originY"])) / float(metrics["cellSize"]))
+    if cell_x < 0 or cell_y < 0 or cell_x >= int(metrics["cols"]) or cell_y >= int(metrics["rows"]):
+        return None
+    return cell_x, cell_y
+
+
+def fallback_cell_to_world(cell: Tuple[int, int], metrics: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "x": float(metrics["originX"]) + (cell[0] + 0.5) * float(metrics["cellSize"]),
+        "y": float(metrics["originY"]) + (cell[1] + 0.5) * float(metrics["cellSize"]),
+    }
+
+
+def fallback_astar_cells(
+    start: Tuple[int, int],
+    goal: Tuple[int, int],
+    blocked: set[Tuple[int, int]],
+    cols: int,
+    rows: int,
+) -> list[Tuple[int, int]]:
+    if goal in blocked or not (0 <= start[0] < cols and 0 <= start[1] < rows):
+        return []
+    blocked = set(blocked)
+    blocked.discard(start)
+    queue: list[Tuple[float, float, Tuple[int, int]]] = []
+    heapq.heappush(queue, (math.hypot(goal[0] - start[0], goal[1] - start[1]), 0.0, start))
+    came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    scores: Dict[Tuple[int, int], float] = {start: 0.0}
+    closed: set[Tuple[int, int]] = set()
+    while queue:
+        _priority, score, current = heapq.heappop(queue)
+        if current in closed:
+            continue
+        if current == goal:
+            path = [current]
+            while path[-1] in came_from:
+                path.append(came_from[path[-1]])
+            return list(reversed(path))
+        closed.add(current)
+        for delta_x, delta_y in (
+            (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)
+        ):
+            next_cell = (current[0] + delta_x, current[1] + delta_y)
+            if (
+                next_cell[0] < 0
+                or next_cell[1] < 0
+                or next_cell[0] >= cols
+                or next_cell[1] >= rows
+                or next_cell in blocked
+                or next_cell in closed
+            ):
+                continue
+            if delta_x and delta_y and (
+                (current[0] + delta_x, current[1]) in blocked
+                or (current[0], current[1] + delta_y) in blocked
+            ):
+                continue
+            next_score = score + math.hypot(delta_x, delta_y)
+            if next_score >= scores.get(next_cell, math.inf):
+                continue
+            scores[next_cell] = next_score
+            came_from[next_cell] = current
+            heuristic = math.hypot(goal[0] - next_cell[0], goal[1] - next_cell[1])
+            heapq.heappush(queue, (next_score + heuristic, next_score, next_cell))
+    return []
+
+
+def fallback_replan_path(
+    setup: Dict[str, Any],
+    pose: Dict[str, Any],
+    route: list[Dict[str, Any]],
+    route_index: int,
+    dynamic_obstacles: list[Dict[str, Any]],
+) -> Tuple[list[Dict[str, Any]], str]:
+    map_config = setup.get("map", {}) or {}
+    source = configured_map_path(map_config)
+    if source is None or not source.exists():
+        return [], "configured map image is unavailable"
+    try:
+        width, height, pixels = load_map_gray(source)
+        apply_setup_overlays_to_map(pixels, width, height, setup)
+        metrics = fallback_grid_metrics(setup, width, height)
+        pose_x = float(pose["x"])
+        pose_y = float(pose["y"])
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        return [], f"map preparation failed: {exc}"
+    start = fallback_world_to_cell(pose_x, pose_y, metrics)
+    if start is None:
+        return [], "current pose is outside the map"
+
+    blocked: set[Tuple[int, int]] = set()
+    for pixel_y in range(height):
+        grid_y = math.floor(((height - 1 - pixel_y) * float(metrics["resolution"])) / float(metrics["cellSize"]))
+        if grid_y < 0 or grid_y >= int(metrics["rows"]):
+            continue
+        row_start = pixel_y * width
+        for pixel_x in range(width):
+            if pixels[row_start + pixel_x] >= 80:
+                continue
+            grid_x = math.floor((pixel_x * float(metrics["resolution"])) / float(metrics["cellSize"]))
+            if 0 <= grid_x < int(metrics["cols"]):
+                blocked.add((grid_x, grid_y))
+    for obstacle in dynamic_obstacles:
+        try:
+            center_x = float(obstacle["x"])
+            center_y = float(obstacle["y"])
+            obstacle_width = float(obstacle.get("width", DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE))
+            obstacle_height = float(obstacle.get("height", DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE))
+        except (KeyError, TypeError, ValueError):
+            continue
+        min_cell = fallback_world_to_cell(
+            center_x - obstacle_width / 2.0, center_y - obstacle_height / 2.0, metrics
+        )
+        max_cell = fallback_world_to_cell(
+            center_x + obstacle_width / 2.0, center_y + obstacle_height / 2.0, metrics
+        )
+        if min_cell is None or max_cell is None:
+            continue
+        for grid_x in range(min_cell[0], max_cell[0] + 1):
+            for grid_y in range(min_cell[1], max_cell[1] + 1):
+                blocked.add((grid_x, grid_y))
+
+    planner = setup.get("planner", {}) or {}
+    object_config = setup.get("object", {}) or {}
+    clearance = max(0.05, float(planner.get("hardClearance") or 0.05)) + max(
+        0.0, float(object_config.get("inflation") or 0.0)
+    )
+    radius_cells = math.ceil(clearance / float(metrics["cellSize"]))
+    inflated = set(blocked)
+    for cell_x, cell_y in blocked:
+        for offset_x in range(-radius_cells, radius_cells + 1):
+            for offset_y in range(-radius_cells, radius_cells + 1):
+                if math.hypot(offset_x, offset_y) * float(metrics["cellSize"]) > clearance:
+                    continue
+                next_cell = cell_x + offset_x, cell_y + offset_y
+                if 0 <= next_cell[0] < int(metrics["cols"]) and 0 <= next_cell[1] < int(metrics["rows"]):
+                    inflated.add(next_cell)
+
+    remaining_route = route[max(0, int(route_index)) :]
+    if not remaining_route:
+        return [], "no remaining route target"
+    path: list[Dict[str, Any]] = []
+    current = start
+    for marker, target in enumerate(remaining_route, start=max(0, int(route_index))):
+        try:
+            target_cell = fallback_world_to_cell(float(target["x"]), float(target["y"]), metrics)
+        except (KeyError, TypeError, ValueError):
+            return [], "route contains an invalid target"
+        if target_cell is None:
+            return [], f"route target {marker + 1} is outside the map"
+        segment = fallback_astar_cells(current, target_cell, inflated, int(metrics["cols"]), int(metrics["rows"]))
+        if not segment:
+            return [], f"no safe detour to route target {marker + 1}"
+        for cell in segment[1 if path else 0 :]:
+            path.append({**fallback_cell_to_world(cell, metrics), "slow": False, "routeIndex": marker})
+        current = target_cell
+    return path, ""
 
 
 def build_robot_bringup_script(network: Dict[str, Any], map_package: Optional[Dict[str, Any]] = None) -> str:
@@ -3709,6 +3900,16 @@ class RosBridge:
             for _, track in sorted(self._dynamic_lidar_obstacle_tracks.items())
         ]
 
+    def _replan_lidar_fallback(
+        self, pose: Dict[str, Any], route: list[Dict[str, Any]], route_index: int
+    ) -> Tuple[list[Dict[str, Any]], str]:
+        snapshot = self.state.snapshot()
+        runtime = snapshot.get("runtime", {}) or {}
+        dynamic_obstacles = runtime.get("dynamicLidarObstacles", []) or []
+        return fallback_replan_path(
+            snapshot.get("setup", {}) or {}, pose, route, route_index, dynamic_obstacles
+        )
+
     def _on_scan(self, msg: Any) -> None:
         received = time.monotonic()
         points = laser_scan_points(
@@ -4338,6 +4539,8 @@ class RosBridge:
             "turn": 0,
         }
         last_safe_safety: Optional[Dict[str, Any]] = None
+        recovery_started_at: Optional[float] = None
+        last_replan_at = -math.inf
         period = 0.1
         try:
             while not self._shutdown_event.is_set() and self._fallback_generation_current(generation):
@@ -4619,13 +4822,91 @@ class RosBridge:
                     last_safe_safety = dict(safety)
                 speed_scale = 1.0
                 if blocked:
+                    if recovery_started_at is None:
+                        recovery_started_at = cycle_started
                     recovery = next_lidar_recovery_command(
                         scan["points"], footprint, recovery, cycle_started
                     )
+                    recovery_duration = cycle_started - recovery_started_at
+                    replan_due = fallback_replan_due(
+                        recovery_started_at,
+                        int(recovery.get("attempts", 0)),
+                        cycle_started,
+                        last_replan_at,
+                    )
+                    if replan_due:
+                        self._publish_cmd_vel(0.0, 0.0)
+                        replanned_path, replan_error = self._replan_lidar_fallback(
+                            pose, route, route_index
+                        )
+                        last_replan_at = cycle_started
+                        if replanned_path:
+                            path = replanned_path
+                            path_index = 0
+                            route_path_ends = {}
+                            for index, point in enumerate(path):
+                                marker = point.get("routeIndex")
+                                if isinstance(marker, int) and 0 <= marker < len(route):
+                                    route_path_ends[marker] = index
+                            recovery = {
+                                "phase": "none",
+                                "started": 0.0,
+                                "attempts": 0,
+                                "turn": 0,
+                            }
+                            recovery_started_at = None
+                            self.state.log_run_event(
+                                "fallback_replan_success",
+                                pose=pose,
+                                routeIndex=route_index,
+                                pathLength=len(path),
+                                recoveryDurationMs=round(recovery_duration * 1000),
+                            )
+                            self.state.update_runtime(
+                                {
+                                    "goal": route[route_index],
+                                    "routeIndex": route_index,
+                                    "navStatus": "fallback_replanned",
+                                    "navMessage": "LiDAR recovery persisted; A* detour path replaced.",
+                                    "fallbackActive": True,
+                                    "fallbackPathIndex": 0,
+                                    "fallbackPathLength": len(path),
+                                    "fallbackSpeedScale": 0.0,
+                                    "fallbackRecoveryPhase": "replanned",
+                                    "fallbackRecoveryAttempts": 0,
+                                    "lastCommandAt": now_iso(),
+                                }
+                            )
+                        else:
+                            self.state.log_run_event(
+                                "fallback_replan_failed",
+                                pose=pose,
+                                routeIndex=route_index,
+                                recoveryDurationMs=round(recovery_duration * 1000),
+                                error=replan_error,
+                            )
+                            self.state.update_runtime(
+                                {
+                                    "goal": route[route_index],
+                                    "routeIndex": route_index,
+                                    "navStatus": "fallback_replan_failed",
+                                    "navMessage": f"LiDAR recovery persisted; A* replan failed: {replan_error}",
+                                    "fallbackActive": True,
+                                    "fallbackSpeedScale": 0.0,
+                                    "fallbackRecoveryPhase": "replan_failed",
+                                    "fallbackRecoveryAttempts": int(recovery.get("attempts", 0)),
+                                    "lastCommandAt": now_iso(),
+                                }
+                            )
+                        self._shutdown_event.wait(
+                            max(0.0, period - (time.monotonic() - cycle_started))
+                        )
+                        continue
                     linear = float(recovery["linear"])
                     angular = float(recovery["angular"])
                     nav_status = f"fallback_recovery_{recovery['phase']}"
                 else:
+                    recovery_started_at = None
                     recovery = {
                         "phase": "none",
                         "started": 0.0,

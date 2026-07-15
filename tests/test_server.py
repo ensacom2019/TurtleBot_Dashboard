@@ -198,6 +198,36 @@ class ServerHelpersTest(unittest.TestCase):
             server.lidar_dynamic_obstacle_cells([(1.0, 0.0)] * 4, None), []
         )
 
+    def test_fallback_astar_cells_avoids_blocked_cells_and_corner_cutting(self) -> None:
+        blocked = {(1, 0), (0, 1)}
+        path = server.fallback_astar_cells((0, 0), (2, 2), blocked, cols=3, rows=3)
+        self.assertEqual(path, [])
+
+    def test_fallback_replan_path_uses_dynamic_lidar_obstacles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            map_path = Path(temp_dir) / "empty.pgm"
+            map_path.write_bytes(b"P5\n10 10\n255\n" + bytes([255]) * 100)
+            setup = {
+                "map": {
+                    "imageUrl": str(map_path),
+                    "resolution": 0.1,
+                    "originX": 0.0,
+                    "originY": 0.0,
+                },
+                "planner": {"cellSize": 0.1, "hardClearance": 0.05},
+                "object": {"inflation": 0.0},
+            }
+            path, error = server.fallback_replan_path(
+                setup,
+                {"x": 0.05, "y": 0.05, "yaw": 0.0},
+                [{"x": 0.95, "y": 0.95}],
+                0,
+                [{"x": 0.45, "y": 0.45, "width": 0.1, "height": 0.1}],
+            )
+        self.assertEqual(error, "")
+        self.assertGreater(len(path), 10)
+        self.assertEqual(path[-1]["routeIndex"], 0)
+
     def test_lidar_safety_marks_predicted_collision_without_early_recovery(self) -> None:
         footprint = {"front": 0.15, "back": 0.15, "left": 0.10, "right": 0.10}
         result = server.evaluate_lidar_safety(
@@ -257,6 +287,13 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertEqual(linear, settings["minLinear"])
         self.assertEqual(angular, server.FALLBACK_LIDAR_COAST_MAX_ANGULAR)
+
+    def test_fallback_replan_due_at_three_seconds_or_five_attempts(self) -> None:
+        self.assertFalse(server.fallback_replan_due(None, 5, 10.0, 0.0))
+        self.assertFalse(server.fallback_replan_due(8.0, 4, 10.9, 0.0))
+        self.assertTrue(server.fallback_replan_due(8.0, 4, 11.0, 0.0))
+        self.assertTrue(server.fallback_replan_due(10.5, 5, 11.0, 0.0))
+        self.assertFalse(server.fallback_replan_due(8.0, 5, 11.0, 9.0))
 
     def test_lidar_safety_keeps_speed_in_clear_space(self) -> None:
         footprint = {"front": 0.15, "back": 0.15, "left": 0.10, "right": 0.10}
