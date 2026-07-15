@@ -183,6 +183,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(sampled[0], [0.0, 0.0])
         self.assertEqual(sampled[1], [0.003, -0.002])
 
+    def test_navigation_path_display_sampling_keeps_the_final_point(self) -> None:
+        path = [{"x": index / 100.0, "y": 0.0, "slow": False} for index in range(10)]
+        sampled = server.sample_navigation_path(path, max_points=3)
+        self.assertLessEqual(len(sampled), 4)
+        self.assertEqual(sampled[-1]["x"], 0.09)
+
     def test_lidar_dynamic_obstacles_require_dense_points_and_transform_to_map(self) -> None:
         obstacles = server.lidar_dynamic_obstacle_cells(
             [(1.00, 0.01), (1.01, 0.02), (1.015, 0.03), (1.018, 0.01), (0.1, 0.0)],

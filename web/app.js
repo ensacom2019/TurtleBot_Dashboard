@@ -3512,7 +3512,12 @@ function drawPlannerGrid(ctx, canvas, setup) {
 }
 
 function drawPlannedPath(ctx, canvas) {
-  const points = state.plannedPath?.points || [];
+  const runtimePath = state.data?.runtime?.fallbackActive
+    ? state.data.runtime.fallbackDisplayPath
+    : null;
+  const points = Array.isArray(runtimePath) && runtimePath.length > 0
+    ? runtimePath
+    : state.plannedPath?.points || [];
   if (points.length < 2) return;
   ctx.save();
   ctx.lineWidth = 4;

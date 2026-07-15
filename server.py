@@ -228,6 +228,7 @@ DEFAULT_STATE: Dict[str, Any] = {
         "fallbackActive": False,
         "fallbackPathIndex": 0,
         "fallbackPathLength": 0,
+        "fallbackDisplayPath": [],
         "fallbackSpeedScale": None,
         "lidarMinClearance": None,
         "fallbackRecoveryPhase": None,
@@ -414,6 +415,32 @@ def sample_lidar_points(
         [round(float(x), 3), round(float(y), 3)]
         for x, y in points[::stride][:max_points]
     ]
+
+
+def sample_navigation_path(
+    points: list[Dict[str, Any]], max_points: int = 320
+) -> list[Dict[str, Any]]:
+    if not points or max_points <= 0:
+        return []
+    stride = max(1, math.ceil(len(points) / int(max_points)))
+    sampled = [
+        {
+            "x": round(float(point["x"]), 3),
+            "y": round(float(point["y"]), 3),
+            "slow": bool(point.get("slow", False)),
+        }
+        for point in points[::stride][:max_points]
+    ]
+    final = points[-1]
+    if sampled and (sampled[-1]["x"] != round(float(final["x"]), 3) or sampled[-1]["y"] != round(float(final["y"]), 3)):
+        sampled.append(
+            {
+                "x": round(float(final["x"]), 3),
+                "y": round(float(final["y"]), 3),
+                "slow": bool(final.get("slow", False)),
+            }
+        )
+    return sampled
 
 
 def lidar_dynamic_obstacle_cells(
@@ -4355,6 +4382,7 @@ class RosBridge:
                 "fallbackActive": True,
                 "fallbackPathIndex": 0,
                 "fallbackPathLength": len(clean_path),
+                "fallbackDisplayPath": sample_navigation_path(clean_path),
                 "fallbackSpeedScale": 0.0,
                 "fallbackRecoveryPhase": "none",
                 "fallbackRecoveryAttempts": 0,
@@ -4871,6 +4899,7 @@ class RosBridge:
                                     "fallbackActive": True,
                                     "fallbackPathIndex": 0,
                                     "fallbackPathLength": len(path),
+                                    "fallbackDisplayPath": sample_navigation_path(path),
                                     "fallbackSpeedScale": 0.0,
                                     "fallbackRecoveryPhase": "replanned",
                                     "fallbackRecoveryAttempts": 0,
