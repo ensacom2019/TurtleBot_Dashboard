@@ -274,7 +274,7 @@
               </div>
               <div id="otherRobotList" class="robot-pose-list"></div>
             </div>
-            <div class="form-grid topics">
+              <div class="form-grid topics">
               <label>
                 Robot IP
                 <input id="robotIp" type="text" />
@@ -343,7 +343,10 @@
                 Cmd Vel
                 <input id="topicCmdVel" type="text" />
               </label>
-            </div>
+              </div>
+              <div class="button-row topic-actions">
+                <button id="resetTopicsButton" type="button" title="현재 활성 로봇의 ROS2 그래프에서 발견한 토픽으로 설정을 갱신합니다.">토픽 초기화</button>
+              </div>
 
             <div class="connection-box">
               <div class="footprint-head">

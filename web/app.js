@@ -117,6 +117,7 @@ function bindElements() {
     "copyDiagnosticsButton",
     "refreshConnectionButton",
     "discoverRobotButton",
+    "resetTopicsButton",
     "robotCheckResults",
     "diagnosticReport",
     "discoveryResults",
@@ -252,6 +253,7 @@ function bindActions() {
   els.clearRunLogsButton.addEventListener("click", clearRunLogs);
   els.refreshConnectionButton.addEventListener("click", refreshConnectionStatus);
   els.discoverRobotButton.addEventListener("click", discoverRobots);
+  els.resetTopicsButton.addEventListener("click", resetTopicsFromRobot);
   els.robotDiscoveryNoticeClose.addEventListener("click", closeRobotDiscoveryNotice);
   els.robotDiscoveryNoticeCloseButton.addEventListener("click", closeRobotDiscoveryNotice);
   els.robotDiscoveryNotice.addEventListener("click", (event) => {
@@ -776,6 +778,31 @@ async function discoverRobots() {
     els.discoveryResults.innerHTML = `<div class="discovery-card"><p>${escapeHtml(error.message)}</p></div>`;
   } finally {
     els.discoverRobotButton.disabled = false;
+  }
+}
+
+async function resetTopicsFromRobot() {
+  const activeRobot = els.activeRobotProfile.value || state.data?.setup?.activeRobot || "tb3_2";
+  els.resetTopicsButton.disabled = true;
+  els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>활성 로봇의 ROS2 토픽을 검색 중...</p></div>`;
+  try {
+    const payload = await postJson("/api/topics/reset", { activeRobot });
+    state.setupDirty = false;
+    if (payload.state) applyState(payload.state);
+    const found = Object.entries(payload.topics || {})
+      .map(([key, value]) => `${key}: ${value}`)
+      .join("\n");
+    els.robotCheckResults.innerHTML = `
+      <div class="discovery-card">
+        <strong>토픽 초기화 완료</strong>
+        <p>${escapeHtml(found || "발견된 토픽 없음")}</p>
+      </div>`;
+    toast("검색된 토픽을 적용하고 ROS 브릿지를 갱신했습니다.");
+  } catch (error) {
+    els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>${escapeHtml(error.message)}</p></div>`;
+    toast(error.message);
+  } finally {
+    els.resetTopicsButton.disabled = false;
   }
 }
 

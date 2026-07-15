@@ -189,6 +189,30 @@ class ServerHelpersTest(unittest.TestCase):
             "/camera/image_raw/compressed",
         )
 
+    def test_detected_candidate_topics_keeps_only_existing_graph_entries(self) -> None:
+        candidate = {
+            "recommendedTopics": {
+                "scan": "/scan",
+                "camera": "/camera/image_raw",
+                "compressedCamera": "/camera/image_raw/compressed",
+                "goalAction": "/navigate_to_pose",
+                "routeAction": "/navigate_through_poses",
+            }
+        }
+        detected = server.detected_candidate_topics(
+            candidate,
+            ["/scan", "/camera/image_raw"],
+            ["/navigate_to_pose"],
+        )
+        self.assertEqual(
+            detected,
+            {
+                "scan": "/scan",
+                "camera": "/camera/image_raw",
+                "goalAction": "/navigate_to_pose",
+            },
+        )
+
     def test_namespaced_route_action(self) -> None:
         topics = server.topics_for_namespace("/tb3_1")
         self.assertEqual(topics["goalAction"], "/tb3_1/navigate_to_pose")

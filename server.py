@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.65"
+APP_VERSION = "2026-07-15.66"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -393,6 +393,36 @@ def synchronize_active_robot_topics(
     profile["topics"] = deep_merge(profile_topics, topics)
     profiles[active_robot] = profile
     setup_patch["robotProfiles"] = profiles
+
+
+def normalized_namespace(value: Any) -> str:
+    namespace = str(value or "/").strip()
+    if not namespace or namespace == "/":
+        return "/"
+    return f"/{namespace.strip('/')}"
+
+
+def detected_candidate_topics(
+    candidate: Dict[str, Any], topic_names: list[str], action_names: list[str]
+) -> Dict[str, str]:
+    """Return only topics/actions which are present in the current ROS graph."""
+    recommended = candidate.get("recommendedTopics")
+    if not isinstance(recommended, dict):
+        return {}
+    topics = set(topic_names)
+    actions = set(action_names)
+    action_keys = {"goalAction", "routeAction"}
+    detected: Dict[str, str] = {}
+    for key, value in recommended.items():
+        name = str(value or "").strip()
+        if not name:
+            continue
+        if key in action_keys:
+            if name in actions:
+                detected[key] = name
+        elif name in topics:
+            detected[key] = name
+    return detected
 
 
 def finite_float(value: Any, field_name: str) -> float:
@@ -3764,6 +3794,15 @@ class NullRosBridge:
             "message": "ROS2 rclpy not available; discovery needs a ROS2-sourced shell.",
             "network": public_network(network),
             "networkDiscovery": discover_same_subnet_ssh_hosts(network),
+        }
+
+    def detect_active_robot_topics(self, active_robot: str = "") -> Dict[str, Any]:
+        _ = active_robot
+        return {
+            "ok": False,
+            "mode": "offline-preview",
+            "topics": {},
+            "message": "ROS2 bridge is not active, so the dashboard cannot search the robot topic graph.",
         }
 
     def shutdown(self) -> None:
@@ -7153,6 +7192,56 @@ class RosBridge:
         self.state.update_runtime({"connection": result["connection"]})
         return result
 
+    def detect_active_robot_topics(self, active_robot: str = "") -> Dict[str, Any]:
+        if self._is_fallback():
+            return self._fallback.detect_active_robot_topics(active_robot)
+        setup = self.state.get_setup()
+        profiles = setup.get("robotProfiles") or {}
+        selected_robot = str(active_robot or setup.get("activeRobot") or "tb3_2")
+        profile = profiles.get(selected_robot) if isinstance(profiles, dict) else None
+        namespace = normalized_namespace(
+            profile.get("namespace") if isinstance(profile, dict) else "/"
+        )
+        topics_and_types = self.node.get_topic_names_and_types()
+        topic_names = sorted(name for name, _types in topics_and_types)
+        actions = self._action_names()
+        candidate = self._score_turtlebot_candidate(
+            topic_names,
+            dict(topics_and_types),
+            sorted(set(self.node.get_node_names())),
+            actions,
+        )
+        candidates = getattr(self, "_last_turtlebot_candidates", [candidate])
+        matching = [
+            item
+            for item in candidates
+            if normalized_namespace(item.get("namespace")) == namespace
+        ]
+        if not matching:
+            return {
+                "ok": False,
+                "mode": "ros2",
+                "activeRobot": selected_robot,
+                "namespace": namespace,
+                "topics": {},
+                "message": "No ROS graph topics were found for the active robot namespace.",
+            }
+        selected_candidate = max(matching, key=lambda item: int(item.get("score") or 0))
+        detected = detected_candidate_topics(selected_candidate, topic_names, actions)
+        return {
+            "ok": bool(detected),
+            "mode": "ros2",
+            "activeRobot": selected_robot,
+            "namespace": namespace,
+            "topics": detected,
+            "matchedTopics": selected_candidate.get("matchedTopics", []),
+            "message": (
+                "Detected active robot topics."
+                if detected
+                else "No configured TurtleBot topics were found for the active robot namespace."
+            ),
+        }
+
     def _action_names(self) -> list[str]:
         if hasattr(self.node, "get_action_names_and_types"):
             try:
@@ -7605,6 +7694,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         "initialPoseApply": initial_pose_result,
                     }
                 )
+                return
+            if parsed.path == "/api/topics/reset":
+                setup = self.context.state.get_setup()
+                active_robot = str(body.get("activeRobot") or setup.get("activeRobot") or "tb3_2")
+                result = self.context.ros.detect_active_robot_topics(active_robot)
+                detected_topics = result.get("topics")
+                if not result.get("ok") or not isinstance(detected_topics, dict):
+                    raise ValueError(result.get("message") or "No robot topics were detected.")
+                updated_topics = deep_merge(setup.get("topics", {}), detected_topics)
+                patch = {"activeRobot": active_robot, "topics": updated_topics}
+                synchronize_active_robot_topics(patch, setup)
+                self.context.state.update_setup(patch)
+                result["rosReload"] = self.context.ros.reload_setup()
+                result["state"] = self.context.state.public_snapshot()
+                self._json(result)
                 return
             if parsed.path == "/api/initial_pose":
                 x, y, yaw = parse_pose(body)
