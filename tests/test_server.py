@@ -13,7 +13,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(setup["map"]["imageUrl"], "/data/Sprite-1.png")
         self.assertEqual((setup["map"]["widthPixels"], setup["map"]["heightPixels"]), (1800, 1800))
         self.assertEqual(setup["initialPose"], {"x": 0.188, "y": 0.224, "yaw": 1.571})
-        self.assertEqual(setup["robot"], {"length": 0.25, "width": 0.15, "radius": 0.146})
+        self.assertEqual(setup["robot"], {"length": 0.18, "width": 0.14, "radius": 0.114})
         self.assertEqual(len(setup["obstacles"]), 2)
         self.assertEqual(
             [(item["width"], item["height"]) for item in setup["obstacles"]],
@@ -58,6 +58,31 @@ class ServerHelpersTest(unittest.TestCase):
         )
         normalized_discovered = server.normalize_robot_profiles_state(discovered_state)
         self.assertIn("tb3_1", normalized_discovered["setup"]["robotProfiles"])
+
+    def test_discovered_robot_position_becomes_an_avoidance_obstacle(self) -> None:
+        setup = {
+            "activeRobot": "tb3_2",
+            "robotProfiles": {
+                "tb3_2": {"label": "TurtleBot 2", "mapPose": {"enabled": True, "x": 0.2, "y": 0.2}},
+                "tb3_3": {
+                    "label": "TurtleBot 3",
+                    "body": {"length": 0.18, "width": 0.14},
+                    "mapPose": {"enabled": True, "x": 0.8, "y": 0.6, "yaw": 1.0},
+                },
+            },
+        }
+        obstacles = server.robot_avoidance_obstacles(setup)
+        self.assertEqual(len(obstacles), 1)
+        self.assertEqual(obstacles[0]["id"], "robot-tb3_3")
+        self.assertGreater(obstacles[0]["width"], 0.18)
+        self.assertGreater(obstacles[0]["height"], 0.14)
+
+    def test_legacy_default_robot_body_is_upgraded_to_18_by_14_centimeters(self) -> None:
+        state = server.deep_merge(
+            server.DEFAULT_STATE, {"setup": {"robot": {"length": 0.25, "width": 0.15, "radius": 0.146}}}
+        )
+        normalized = server.normalize_robot_profiles_state(state)
+        self.assertEqual(normalized["setup"]["robot"], {"length": 0.18, "width": 0.14, "radius": 0.114})
 
     def test_map_editor_dimensions_require_whole_centimeters(self) -> None:
         self.assertEqual(

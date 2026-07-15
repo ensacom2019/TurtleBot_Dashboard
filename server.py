@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.57"
+APP_VERSION = "2026-07-15.58"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -66,6 +66,9 @@ MAX_JSON_BODY_BYTES = 24 * 1024 * 1024
 MAX_MAP_UPLOAD_BYTES = 18 * 1024 * 1024
 TWIST_TYPE = "geometry_msgs/msg/Twist"
 TWIST_STAMPED_TYPE = "geometry_msgs/msg/TwistStamped"
+DEFAULT_TURTLEBOT_LENGTH = 0.18
+DEFAULT_TURTLEBOT_WIDTH = 0.14
+DEFAULT_TURTLEBOT_RADIUS = 0.114
 
 
 def topics_for_namespace(namespace: str, camera_style: str = "color") -> Dict[str, str]:
@@ -102,6 +105,8 @@ DEFAULT_ROBOT_PROFILES = {
     "tb3_2": {
         "label": "TurtleBot 2",
         "namespace": "/",
+        "body": {"length": DEFAULT_TURTLEBOT_LENGTH, "width": DEFAULT_TURTLEBOT_WIDTH},
+        "mapPose": {"enabled": False, "x": None, "y": None, "yaw": 0.0},
         "topics": topics_for_namespace("/", "camera_ros"),
     },
 }
@@ -137,7 +142,11 @@ DEFAULT_STATE: Dict[str, Any] = {
         },
         "mapLibrary": DEFAULT_MAP_LIBRARY,
         "initialPose": {"x": 0.188, "y": 0.224, "yaw": 1.571},
-        "robot": {"length": 0.25, "width": 0.15, "radius": 0.146},
+        "robot": {
+            "length": DEFAULT_TURTLEBOT_LENGTH,
+            "width": DEFAULT_TURTLEBOT_WIDTH,
+            "radius": DEFAULT_TURTLEBOT_RADIUS,
+        },
         "accessory": {"front": 0.0, "back": 0.0, "left": 0.0, "right": 0.0, "height": 0.0},
         "safety": {"margin": 0.0},
         "object": {"width": 0.13, "height": 0.13, "inflation": 0.0},
@@ -265,6 +274,36 @@ def deep_merge(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]
     return merged
 
 
+def normalized_robot_body(body: Any) -> Dict[str, float]:
+    raw = body if isinstance(body, dict) else {}
+    try:
+        length = float(raw.get("length", DEFAULT_TURTLEBOT_LENGTH))
+    except (TypeError, ValueError):
+        length = DEFAULT_TURTLEBOT_LENGTH
+    try:
+        width = float(raw.get("width", DEFAULT_TURTLEBOT_WIDTH))
+    except (TypeError, ValueError):
+        width = DEFAULT_TURTLEBOT_WIDTH
+    return {
+        "length": clamp(length, 0.05, 0.80),
+        "width": clamp(width, 0.05, 0.80),
+    }
+
+
+def normalized_robot_map_pose(map_pose: Any) -> Dict[str, Any]:
+    raw = map_pose if isinstance(map_pose, dict) else {}
+    values: Dict[str, Any] = {"enabled": bool(raw.get("enabled", False)), "yaw": 0.0}
+    for key in ("x", "y", "yaw"):
+        try:
+            value = float(raw.get(key))
+        except (TypeError, ValueError):
+            value = None if key in ("x", "y") else 0.0
+        values[key] = value if value is not None and math.isfinite(value) else (None if key in ("x", "y") else 0.0)
+    if values["x"] is None or values["y"] is None:
+        values["enabled"] = False
+    return values
+
+
 def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
     """Keep only TurtleBot 2 initially; retain profiles added by robot discovery."""
     setup = state.setdefault("setup", {})
@@ -276,7 +315,30 @@ def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
         profiles.pop("tb3_1", None)
     if "tb3_2" not in profiles:
         profiles["tb3_2"] = json.loads(json.dumps(DEFAULT_ROBOT_PROFILES["tb3_2"]))
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        profile["body"] = normalized_robot_body(profile.get("body"))
+        profile["mapPose"] = normalized_robot_map_pose(profile.get("mapPose"))
     setup["robotProfiles"] = profiles
+    robot = setup.get("robot") if isinstance(setup.get("robot"), dict) else {}
+    try:
+        legacy_length = float(robot.get("length", 0.0) or 0.0)
+        legacy_width = float(robot.get("width", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        legacy_length = legacy_width = 0.0
+    if (
+        not robot
+        or (
+            legacy_length == 0.25
+            and legacy_width == 0.15
+        )
+    ):
+        setup["robot"] = {
+            "length": DEFAULT_TURTLEBOT_LENGTH,
+            "width": DEFAULT_TURTLEBOT_WIDTH,
+            "radius": DEFAULT_TURTLEBOT_RADIUS,
+        }
     active_robot = str(setup.get("activeRobot") or "tb3_2")
     if active_robot not in profiles:
         active_robot = "tb3_2"
@@ -378,6 +440,35 @@ def effective_footprint_from_setup(setup: Dict[str, Any]) -> Dict[str, float]:
         "left": half_width + max(0.0, float(accessory.get("left", 0.0))) + margin,
         "right": half_width + max(0.0, float(accessory.get("right", 0.0))) + margin,
     }
+
+
+def robot_avoidance_obstacles(setup: Dict[str, Any]) -> list[Dict[str, Any]]:
+    profiles = setup.get("robotProfiles", {}) or {}
+    active_robot = str(setup.get("activeRobot") or "")
+    if not isinstance(profiles, dict):
+        return []
+    obstacles = []
+    for profile_id, profile in profiles.items():
+        if profile_id == active_robot or not isinstance(profile, dict):
+            continue
+        pose = normalized_robot_map_pose(profile.get("mapPose"))
+        if not pose["enabled"]:
+            continue
+        body = normalized_robot_body(profile.get("body"))
+        cos_yaw = abs(math.cos(float(pose["yaw"])))
+        sin_yaw = abs(math.sin(float(pose["yaw"])))
+        obstacles.append(
+            {
+                "id": f"robot-{profile_id}",
+                "label": str(profile.get("label") or profile_id),
+                "x": pose["x"],
+                "y": pose["y"],
+                "yaw": pose["yaw"],
+                "width": body["length"] * cos_yaw + body["width"] * sin_yaw,
+                "height": body["length"] * sin_yaw + body["width"] * cos_yaw,
+            }
+        )
+    return obstacles
 
 
 def laser_scan_points(
@@ -1727,7 +1818,7 @@ def fallback_replan_path(
             grid_x = math.floor((pixel_x * float(metrics["resolution"])) / float(metrics["cellSize"]))
             if 0 <= grid_x < int(metrics["cols"]):
                 blocked.add((grid_x, grid_y))
-    for obstacle in dynamic_obstacles:
+    for obstacle in [*robot_avoidance_obstacles(setup), *dynamic_obstacles]:
         try:
             center_x = float(obstacle["x"])
             center_y = float(obstacle["y"])
@@ -2923,6 +3014,7 @@ class DashboardState:
     def update_setup(self, patch: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             self._state["setup"] = deep_merge(self._state["setup"], patch)
+            self._state = normalize_robot_profiles_state(self._state)
             if "initialPose" in patch:
                 pose = self._state["setup"]["initialPose"]
                 self._state["runtime"]["pose"] = {

@@ -40,6 +40,8 @@ const DEFAULT_ROBOT_PROFILES = {
   tb3_2: {
     label: "TurtleBot 2",
     namespace: "/",
+    body: { length: 0.18, width: 0.14 },
+    mapPose: { enabled: false, x: null, y: null, yaw: 0 },
     topics: topicsForNamespace("/", "camera_ros"),
   },
 };
@@ -80,6 +82,7 @@ function bindElements() {
     "clearGridButton",
     "robotIp",
     "activeRobotProfile",
+    "otherRobotList",
     "serverIp",
     "rosDomainId",
     "rosLocalhostOnly",
@@ -482,6 +485,7 @@ function fillSetupForm(setup) {
   setInputIfIdle(els.detectLidarObstacles, setup.planner?.detectLidarObstacles ?? true);
   setInputIfIdle(els.detectBlackWalls, setup.planner?.detectBlackWalls ?? true);
   renderRobotProfileControls(setup);
+  renderOtherRobotList(setup);
   setInputIfIdle(els.activeRobotProfile, setup.activeRobot || "tb3_2");
   setInputIfIdle(els.robotIp, setup.network?.robotIp ?? "");
   setInputIfIdle(els.serverIp, setup.network?.serverIp ?? "");
@@ -1150,6 +1154,8 @@ function addDiscoveredRobotProfiles(candidates) {
       label: robotNumber ? `TurtleBot ${robotNumber}` : `TurtleBot ${namespace.replace(/^\//, "")}`,
       namespace,
       source: "discovered",
+      body: { length: 0.18, width: 0.14 },
+      mapPose: { enabled: false, x: null, y: null, yaw: 0 },
       topics: {
         ...topicsForNamespace(namespace, "color"),
         ...(candidate.recommendedTopics || {}),
@@ -1160,6 +1166,7 @@ function addDiscoveredRobotProfiles(candidates) {
   if (added.length) {
     state.data.setup.robotProfiles = profiles;
     renderRobotProfileControls({ ...state.data.setup, robotProfiles: profiles });
+    renderOtherRobotList({ ...state.data.setup, robotProfiles: profiles });
     markSetupDirty();
   }
   return added;
@@ -1225,6 +1232,61 @@ function renderRobotProfileControls(setup) {
   }
 }
 
+function renderOtherRobotList(setup) {
+  if (!els.otherRobotList) return;
+  const activeRobot = setup.activeRobot || "tb3_2";
+  const profiles = Object.entries(normalizedRobotProfiles(setup))
+    .filter(([id]) => id !== activeRobot);
+  if (profiles.length === 0) {
+    els.otherRobotList.innerHTML = `<div class="robot-pose-row empty"><p>탐색된 다른 로봇이 없습니다.</p></div>`;
+    return;
+  }
+  els.otherRobotList.innerHTML = profiles.map(([id, profile]) => {
+    const pose = profile.mapPose;
+    const body = profile.body;
+    return `
+      <div class="robot-pose-row" data-other-robot="${escapeHtml(id)}">
+        <strong>${escapeHtml(profile.label)} <span>${escapeHtml(profile.namespace)}</span></strong>
+        <label class="check-row"><input type="checkbox" data-robot-field="enabled" ${pose.enabled ? "checked" : ""} />회피</label>
+        <label>X<input type="number" step="0.01" data-robot-field="x" value="${pose.x ?? ""}" /></label>
+        <label>Y<input type="number" step="0.01" data-robot-field="y" value="${pose.y ?? ""}" /></label>
+        <label>방향<input type="number" step="0.01" data-robot-field="yaw" value="${round(pose.yaw)}" /></label>
+        <label>가로 m<input type="number" step="0.01" min="0.05" data-robot-field="length" value="${round(body.length)}" /></label>
+        <label>세로 m<input type="number" step="0.01" min="0.05" data-robot-field="width" value="${round(body.width)}" /></label>
+      </div>`;
+  }).join("");
+  els.otherRobotList.querySelectorAll("[data-robot-field]").forEach((input) => {
+    input.addEventListener("change", () => updateOtherRobotProfile(input.closest("[data-other-robot]")));
+  });
+}
+
+function updateOtherRobotProfile(row) {
+  if (!row || !state.data?.setup) return;
+  const profileId = row.dataset.otherRobot;
+  const profiles = normalizedRobotProfiles(state.data.setup);
+  const profile = profiles[profileId];
+  if (!profile) return;
+  const value = (field) => row.querySelector(`[data-robot-field="${field}"]`);
+  const x = optionalNumberValue(value("x"));
+  const y = optionalNumberValue(value("y"));
+  const mapPose = normalizedRobotMapPose({
+    enabled: value("enabled").checked,
+    x,
+    y,
+    yaw: numberValue(value("yaw")),
+  });
+  profiles[profileId] = {
+    ...profile,
+    body: normalizedRobotBody({
+      length: numberValue(value("length")),
+      width: numberValue(value("width")),
+    }),
+    mapPose,
+  };
+  state.data.setup.robotProfiles = profiles;
+  markSetupDirty();
+}
+
 function applyRobotProfile(profileId) {
   const profiles = normalizedRobotProfiles(state.data?.setup || {});
   const profile = profiles[profileId];
@@ -1242,6 +1304,7 @@ function applyRobotProfile(profileId) {
   if (topics.goalAction) els.topicGoalAction.value = topics.goalAction;
   if (topics.routeAction) els.topicRouteAction.value = topics.routeAction;
   renderRobotProfileControls({ ...currentSetup(), activeRobot: profileId });
+  renderOtherRobotList({ ...currentSetup(), activeRobot: profileId });
   markSetupDirty();
   toast(`${profile.label} 토픽을 적용했습니다. 저장하면 연결 대상이 바뀝니다.`);
 }
@@ -1902,9 +1965,12 @@ function normalizedRobotProfiles(setup = state.data?.setup || {}) {
     const namespace = profile.namespace || fallback.namespace || `/${id}`;
     const cameraStyle = id === "tb3_2" ? "camera_ros" : "color";
     profiles[id] = {
+      ...profile,
       label: profile.label || fallback.label || id,
       namespace,
       source: profile.source || fallback.source || "",
+      body: normalizedRobotBody(profile.body || fallback.body),
+      mapPose: normalizedRobotMapPose(profile.mapPose || fallback.mapPose),
       topics: {
         ...topicsForNamespace(namespace, cameraStyle),
         ...(fallback.topics || {}),
@@ -1913,6 +1979,50 @@ function normalizedRobotProfiles(setup = state.data?.setup || {}) {
     };
   }
   return profiles;
+}
+
+function normalizedRobotBody(body = {}) {
+  return {
+    length: Math.min(0.8, Math.max(0.05, Number(body.length) || 0.18)),
+    width: Math.min(0.8, Math.max(0.05, Number(body.width) || 0.14)),
+  };
+}
+
+function normalizedRobotMapPose(mapPose = {}) {
+  const x = optionalFiniteNumber(mapPose.x);
+  const y = optionalFiniteNumber(mapPose.y);
+  return {
+    enabled: Boolean(mapPose.enabled) && x !== null && y !== null,
+    x,
+    y,
+    yaw: normalizedYaw(Number(mapPose.yaw) || 0),
+  };
+}
+
+function optionalFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function avoidanceRobotObstacles(setup) {
+  const activeRobot = setup.activeRobot || "tb3_2";
+  return Object.entries(normalizedRobotProfiles(setup))
+    .filter(([id, profile]) => id !== activeRobot && profile.mapPose.enabled)
+    .map(([id, profile]) => {
+      const cosYaw = Math.abs(Math.cos(profile.mapPose.yaw));
+      const sinYaw = Math.abs(Math.sin(profile.mapPose.yaw));
+      return {
+        id: `robot-${id}`,
+        label: profile.label,
+        x: profile.mapPose.x,
+        y: profile.mapPose.y,
+        yaw: profile.mapPose.yaw,
+        bodyLength: profile.body.length,
+        bodyWidth: profile.body.width,
+        width: profile.body.length * cosYaw + profile.body.width * sinYaw,
+        height: profile.body.length * sinYaw + profile.body.width * cosYaw,
+      };
+    });
 }
 
 function currentTopicInputs() {
@@ -2239,7 +2349,10 @@ function blockedCellSet(setup) {
 }
 
 function obstacleCellKeys(setup) {
-  return obstacleCellsFor(normalizeObstacles(setup.obstacles || []), setup);
+  return obstacleCellsFor(
+    [...normalizeObstacles(setup.obstacles || []), ...avoidanceRobotObstacles(setup)],
+    setup,
+  );
 }
 
 function dynamicLidarObstacleCellKeys(setup) {
@@ -3351,6 +3464,7 @@ function drawMap(canvas, mode) {
 
   drawPlanningOverlay(ctx, canvas, setup, mode);
   drawLidarPoints(ctx, canvas, runtime, setup);
+  drawAvoidanceRobots(ctx, canvas, setup);
   if (mode === "drive") drawLidarConnectionAlarm(ctx, canvas, runtime);
   if (mode === "drive") {
     drawWaypointMarkers(ctx, canvas);
@@ -3726,6 +3840,31 @@ function drawSetupObject(ctx, canvas, setup, pose) {
   if (state.setupTool !== "object" && !state.setupObjectRect) return;
   const rect = state.setupObjectRect || defaultObjectRect(setup, pose);
   drawObstacleRect(ctx, canvas, rect, "new", true);
+}
+
+function drawAvoidanceRobots(ctx, canvas, setup) {
+  for (const robot of avoidanceRobotObstacles(setup)) {
+    const center = worldToCanvas(robot.x, robot.y, canvas);
+    if (!center) continue;
+    const transform = getMapTransform(canvas);
+    const resolution = mapResolution();
+    const length = Math.max(8, (robot.bodyLength / resolution) * transform.scale);
+    const width = Math.max(8, (robot.bodyWidth / resolution) * transform.scale);
+    ctx.save();
+    ctx.translate(center.x, center.y);
+    ctx.rotate(-(Number(robot.yaw) || 0));
+    ctx.fillStyle = "rgba(232, 184, 95, 0.32)";
+    ctx.strokeStyle = "#e8b85f";
+    ctx.lineWidth = 2;
+    ctx.fillRect(-length / 2, -width / 2, length, width);
+    ctx.strokeRect(-length / 2, -width / 2, length, width);
+    ctx.restore();
+    ctx.save();
+    ctx.fillStyle = "#f5dfab";
+    ctx.font = "600 12px Inter, system-ui, sans-serif";
+    ctx.fillText(robot.label, center.x + 8, center.y - 8);
+    ctx.restore();
+  }
 }
 
 function drawObstacleRect(ctx, canvas, rect, label, dashed) {
