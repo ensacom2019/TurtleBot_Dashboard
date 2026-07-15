@@ -121,14 +121,30 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_robot_bringup_script_uses_a_systemd_cgroup_for_base(self) -> None:
         script = server.build_robot_bringup_script(
-            {"rosDomainId": "1", "rosLocalhostOnly": "0"}
+            {
+                "rosDomainId": "1",
+                "rosLocalhostOnly": "0",
+                "robotSshPassword": "bringup-test-password",
+            }
         )
         self.assertIn('BASE_SERVICE="turtlebot-dashboard-base.service"', script)
         self.assertIn("systemctl --user start", script)
         self.assertIn("KillMode=control-group", script)
         self.assertIn("KillSignal=SIGINT", script)
         self.assertIn("loginctl show-user", script)
+        self.assertIn("ensure_user_linger", script)
+        self.assertIn('sudo -n loginctl enable-linger "$USER"', script)
+        self.assertIn("sudo -S -p '' loginctl enable-linger", script)
+        self.assertIn("unset SUDO_PASSWORD_B64", script)
+        self.assertNotIn("bringup-test-password", script)
         self.assertNotIn("start_detached tb3_base", script)
+
+    def test_robot_bringup_script_handles_missing_sudo_password(self) -> None:
+        script = server.build_robot_bringup_script(
+            {"rosDomainId": "1", "rosLocalhostOnly": "0", "robotSshPassword": ""}
+        )
+        self.assertIn("no SSH password is configured for sudo", script)
+        self.assertIn("sudo loginctl enable-linger $USER", script)
 
     def test_robot_bringup_stop_script_stops_the_systemd_base_service(self) -> None:
         script = server.build_robot_bringup_stop_script(

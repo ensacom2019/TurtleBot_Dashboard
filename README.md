@@ -113,7 +113,7 @@ python server.py --host 127.0.0.1 --port 8080
 - 현재 선택한 대시보드 맵을 ROS map 파일로 전송
 - Nav2/AMCL과 카메라 bringup
 
-처음 한 번 로봇에서 아래 명령을 실행해 SSH 사용자의 systemd 서비스를 로그인 종료 후에도 유지해야 합니다.
+`로봇 브링업`은 SSH 사용자의 systemd 서비스를 로그인 종료 후에도 유지하도록 linger 설정을 확인합니다. 꺼져 있으면 먼저 비밀번호 없는 sudo를 시도하고, 이어서 셋업에 저장된 SSH 비밀번호로 자동 활성화합니다. 로봇 계정에 sudo 권한이 없거나 sudo 비밀번호가 SSH 비밀번호와 다를 때만 로봇에서 아래 명령을 한 번 직접 실행하면 됩니다.
 
 ```bash
 sudo loginctl enable-linger kim

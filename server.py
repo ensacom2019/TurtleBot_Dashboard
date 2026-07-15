@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.68"
+APP_VERSION = "2026-07-15.69"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -2060,6 +2060,9 @@ def fallback_replan_path(
 def build_robot_bringup_script(network: Dict[str, Any], map_package: Optional[Dict[str, Any]] = None) -> str:
     domain = shlex.quote(str(network.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or "1"))
     localhost_only = shlex.quote(str(network.get("rosLocalhostOnly") or "0"))
+    ssh_password = str(network.get("robotSshPassword") or "")
+    sudo_password_b64 = base64.b64encode((ssh_password + "\n").encode("utf-8")).decode("ascii") if ssh_password else ""
+    sudo_password_b64_q = shlex.quote(sudo_password_b64)
     map_upload_script = ""
     if map_package:
         map_upload_script = f"""
@@ -2150,6 +2153,43 @@ start_detached() {{
 }}
 
 BASE_SERVICE="turtlebot-dashboard-base.service"
+SUDO_PASSWORD_B64={sudo_password_b64_q}
+
+ensure_user_linger() {{
+  local linger
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
+  if [ "$linger" = "yes" ]; then
+    echo "[OK] systemd user lingering is already enabled for $USER."
+    unset SUDO_PASSWORD_B64
+    return 0
+  fi
+
+  echo "[INFO] Enabling systemd user lingering for $USER."
+  if sudo -n loginctl enable-linger "$USER" >/dev/null 2>&1; then
+    :
+  elif [ -n "$SUDO_PASSWORD_B64" ]; then
+    if ! printf '%s' "$SUDO_PASSWORD_B64" | base64 -d | sudo -S -p '' loginctl enable-linger "$USER" >/dev/null; then
+      unset SUDO_PASSWORD_B64
+      echo "[FAIL] Could not enable systemd user lingering with the configured SSH password."
+      echo "[FIX] Check sudo permission/password, or run once on the robot: sudo loginctl enable-linger $USER"
+      return 14
+    fi
+  else
+    unset SUDO_PASSWORD_B64
+    echo "[FAIL] systemd user lingering is disabled and no SSH password is configured for sudo."
+    echo "[FIX] Configure the SSH password or run once on the robot: sudo loginctl enable-linger $USER"
+    return 14
+  fi
+  unset SUDO_PASSWORD_B64
+
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
+  if [ "$linger" != "yes" ]; then
+    echo "[FAIL] systemd user lingering is still disabled for $USER."
+    echo "[FIX] Run once on the robot: sudo loginctl enable-linger $USER"
+    return 14
+  fi
+  echo "[OK] systemd user lingering enabled for $USER."
+}}
 
 start_base_service() {{
   local opencr_port="$1"
@@ -2157,17 +2197,11 @@ start_base_service() {{
   local unit_file="$unit_dir/$BASE_SERVICE"
   local base_script="$LOG_DIR/tb3_base.sh"
   local base_log="$LOG_DIR/tb3_base.log"
+  ensure_user_linger || return 14
   if ! systemctl --user show-environment >/dev/null 2>&1; then
     echo "[FAIL] systemd user manager is unavailable for $USER."
     echo "[FIX] Log in as this robot user and make systemctl --user available before dashboard bringup."
     return 13
-  fi
-  local linger
-  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
-  if [ "$linger" != "yes" ]; then
-    echo "[FAIL] systemd user lingering is disabled for $USER."
-    echo "[FIX] Run once on the robot: sudo loginctl enable-linger $USER"
-    return 14
   fi
   mkdir -p "$unit_dir"
   cat > "$base_script" <<BASE_SCRIPT
