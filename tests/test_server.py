@@ -163,6 +163,32 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(topics["camera"], "/camera/camera/image_raw")
         self.assertEqual(topics["routeAction"], "/navigate_through_poses")
 
+    def test_topic_edits_are_persisted_to_the_active_robot_profile(self) -> None:
+        setup = server.deep_merge(server.DEFAULT_STATE["setup"], {})
+        patch = {
+            "activeRobot": "tb3_2",
+            "topics": {
+                "camera": "/camera/image_raw",
+                "compressedCamera": "/camera/image_raw/compressed",
+            },
+        }
+
+        server.synchronize_active_robot_topics(patch, setup)
+        saved = server.deep_merge(setup, patch)
+
+        self.assertEqual(saved["topics"]["camera"], "/camera/image_raw")
+        self.assertEqual(
+            saved["topics"]["compressedCamera"], "/camera/image_raw/compressed"
+        )
+        self.assertEqual(
+            saved["robotProfiles"]["tb3_2"]["topics"]["camera"],
+            "/camera/image_raw",
+        )
+        self.assertEqual(
+            saved["robotProfiles"]["tb3_2"]["topics"]["compressedCamera"],
+            "/camera/image_raw/compressed",
+        )
+
     def test_namespaced_route_action(self) -> None:
         topics = server.topics_for_namespace("/tb3_1")
         self.assertEqual(topics["goalAction"], "/tb3_1/navigate_to_pose")

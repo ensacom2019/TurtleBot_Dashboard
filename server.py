@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.64"
+APP_VERSION = "2026-07-15.65"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -363,6 +363,36 @@ def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
         setup["activeRobot"] = active_robot
         setup["topics"] = dict(profiles[active_robot].get("topics") or {})
     return state
+
+
+def synchronize_active_robot_topics(
+    setup_patch: Dict[str, Any], existing_setup: Dict[str, Any]
+) -> None:
+    """Persist edited topic fields with the active robot profile as well as setup.topics."""
+    topics = setup_patch.get("topics")
+    if not isinstance(topics, dict):
+        return
+    active_robot = str(
+        setup_patch.get("activeRobot") or existing_setup.get("activeRobot") or "tb3_2"
+    )
+    incoming_profiles = setup_patch.get("robotProfiles")
+    profiles_source = (
+        incoming_profiles
+        if isinstance(incoming_profiles, dict)
+        else existing_setup.get("robotProfiles", {})
+    )
+    profiles = (
+        json.loads(json.dumps(profiles_source))
+        if isinstance(profiles_source, dict)
+        else {}
+    )
+    profile = profiles.get(active_robot)
+    if not isinstance(profile, dict):
+        profile = {}
+    profile_topics = profile.get("topics") if isinstance(profile.get("topics"), dict) else {}
+    profile["topics"] = deep_merge(profile_topics, topics)
+    profiles[active_robot] = profile
+    setup_patch["robotProfiles"] = profiles
 
 
 def finite_float(value: Any, field_name: str) -> float:
@@ -7559,6 +7589,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     # A path planned from the former pose must not continue after
                     # the operator relocates the robot on the dashboard map.
                     self.context.ros.cancel_goal()
+                synchronize_active_robot_topics(body, old_setup)
                 self.context.state.update_setup(body)
                 reload_result = None
                 if body.get("topics") and body.get("topics") != old_topics:
