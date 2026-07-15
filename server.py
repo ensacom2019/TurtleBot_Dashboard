@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.58"
+APP_VERSION = "2026-07-15.59"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -55,8 +55,10 @@ FALLBACK_LIDAR_COAST_MIN_CLEARANCE = 0.12
 FALLBACK_LIDAR_COAST_MAX_ANGULAR = 0.25
 FALLBACK_REPLAN_RECOVERY_SECONDS = 3.0
 FALLBACK_REPLAN_RECOVERY_ATTEMPTS = 5
+FALLBACK_DYNAMIC_REPLAN_LOOKAHEAD = 0.45
+FALLBACK_DYNAMIC_REPLAN_COOLDOWN = 1.5
 DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE = 0.08
-DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS = 4
+DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS = 5
 DYNAMIC_LIDAR_OBSTACLE_HOLD_SECONDS = 1.0
 DYNAMIC_LIDAR_OBSTACLE_MIN_RANGE = 0.18
 DYNAMIC_LIDAR_OBSTACLE_MAX_RANGE = 2.5
@@ -564,38 +566,18 @@ def lidar_dynamic_obstacle_cells(
         key = (math.floor(world_x / cell_size), math.floor(world_y / cell_size))
         counts[key] = counts.get(key, 0) + 1
 
-    cells = []
-    unvisited = set(counts)
-    while unvisited:
-        first = unvisited.pop()
-        component = [first]
-        queue = [first]
-        while queue:
-            grid_x, grid_y = queue.pop()
-            for offset_x in (-1, 0, 1):
-                for offset_y in (-1, 0, 1):
-                    if offset_x == 0 and offset_y == 0:
-                        continue
-                    neighbor = (grid_x + offset_x, grid_y + offset_y)
-                    if neighbor in unvisited:
-                        unvisited.remove(neighbor)
-                        queue.append(neighbor)
-                        component.append(neighbor)
-        point_count = sum(counts[key] for key in component)
-        if point_count < min_points:
-            continue
-        for grid_x, grid_y in component:
-            cells.append(
-                {
-                    "id": f"lidar-{grid_x}-{grid_y}",
-                    "x": round((grid_x + 0.5) * cell_size, 3),
-                    "y": round((grid_y + 0.5) * cell_size, 3),
-                    "width": cell_size,
-                    "height": cell_size,
-                    "points": point_count,
-                }
-            )
-    return cells
+    return [
+        {
+            "id": f"lidar-{grid_x}-{grid_y}",
+            "x": round((grid_x + 0.5) * cell_size, 3),
+            "y": round((grid_y + 0.5) * cell_size, 3),
+            "width": cell_size,
+            "height": cell_size,
+            "points": point_count,
+        }
+        for (grid_x, grid_y), point_count in counts.items()
+        if point_count >= min_points
+    ]
 
 
 def rectangle_clearance(
@@ -757,6 +739,63 @@ def fallback_replan_due(
     persisted = now - recovery_started_at >= FALLBACK_REPLAN_RECOVERY_SECONDS
     exhausted = attempts >= FALLBACK_REPLAN_RECOVERY_ATTEMPTS
     return (persisted or exhausted) and now - last_replan_at >= FALLBACK_REPLAN_RECOVERY_SECONDS
+
+
+def fallback_path_hits_dynamic_obstacle(
+    path: list[Dict[str, Any]],
+    path_index: int,
+    pose: Dict[str, Any],
+    obstacles: list[Dict[str, Any]],
+    lookahead: float = FALLBACK_DYNAMIC_REPLAN_LOOKAHEAD,
+    clearance: float = 0.0,
+) -> bool:
+    """Detect an active temporary LiDAR cell on the next part of a fallback path."""
+    if not path or not obstacles or lookahead <= 0.0:
+        return False
+    try:
+        previous_x = float(pose["x"])
+        previous_y = float(pose["y"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (previous_x, previous_y)):
+        return False
+
+    remaining = lookahead
+    valid_obstacles = []
+    for obstacle in obstacles:
+        try:
+            obstacle_x = float(obstacle["x"])
+            obstacle_y = float(obstacle["y"])
+            half_width = max(0.0, float(obstacle.get("width", 0.0)) / 2.0) + clearance
+            half_height = max(0.0, float(obstacle.get("height", 0.0)) / 2.0) + clearance
+        except (KeyError, TypeError, ValueError):
+            continue
+        valid_obstacles.append((obstacle_x, obstacle_y, half_width, half_height))
+
+    for point in path[max(0, path_index) :]:
+        try:
+            next_x = float(point["x"])
+            next_y = float(point["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        segment_length = math.hypot(next_x - previous_x, next_y - previous_y)
+        inspected_length = min(segment_length, remaining)
+        samples = max(1, int(math.ceil(inspected_length / 0.02)))
+        for sample_index in range(samples + 1):
+            ratio = min(1.0, inspected_length * sample_index / samples / max(segment_length, 1e-9))
+            point_x = previous_x + (next_x - previous_x) * ratio
+            point_y = previous_y + (next_y - previous_y) * ratio
+            if any(
+                abs(point_x - obstacle_x) <= half_width
+                and abs(point_y - obstacle_y) <= half_height
+                for obstacle_x, obstacle_y, half_width, half_height in valid_obstacles
+            ):
+                return True
+        remaining -= segment_length
+        if remaining <= 0.0:
+            break
+        previous_x, previous_y = next_x, next_y
+    return False
 
 
 def choose_lidar_recovery_turn(points: list[Tuple[float, float]]) -> int:
@@ -4661,6 +4700,12 @@ class RosBridge:
         last_safe_safety: Optional[Dict[str, Any]] = None
         recovery_started_at: Optional[float] = None
         last_replan_at = -math.inf
+        try:
+            dynamic_replan_clearance = max(
+                0.0, float((fallback_setup.get("planner") or {}).get("hardClearance", 0.0))
+            )
+        except (TypeError, ValueError):
+            dynamic_replan_clearance = 0.0
         period = 0.1
         try:
             while not self._shutdown_event.is_set() and self._fallback_generation_current(generation):
@@ -4937,23 +4982,38 @@ class RosBridge:
                     settings["softDistance"],
                     settings["collisionHorizon"],
                 )
-                blocked = bool(safety["recoveryRequired"])
+                dynamic_obstacles = runtime.get("dynamicLidarObstacles") or []
+                dynamic_path_blocked = fallback_path_hits_dynamic_obstacle(
+                    path,
+                    path_index,
+                    pose,
+                    dynamic_obstacles,
+                    clearance=dynamic_replan_clearance,
+                )
+                blocked = bool(safety["recoveryRequired"]) or dynamic_path_blocked
                 if not blocked and not bool(safety["collision"]):
                     last_safe_safety = dict(safety)
                 speed_scale = 1.0
                 if blocked:
                     if recovery_started_at is None:
                         recovery_started_at = cycle_started
-                    recovery = next_lidar_recovery_command(
-                        scan["points"], footprint, recovery, cycle_started
-                    )
                     recovery_duration = cycle_started - recovery_started_at
-                    replan_due = fallback_replan_due(
-                        recovery_started_at,
-                        int(recovery.get("attempts", 0)),
-                        cycle_started,
-                        last_replan_at,
-                    )
+                    if dynamic_path_blocked:
+                        replan_reason = "dynamic_obstacle"
+                        replan_due = (
+                            cycle_started - last_replan_at >= FALLBACK_DYNAMIC_REPLAN_COOLDOWN
+                        )
+                    else:
+                        recovery = next_lidar_recovery_command(
+                            scan["points"], footprint, recovery, cycle_started
+                        )
+                        replan_reason = "recovery"
+                        replan_due = fallback_replan_due(
+                            recovery_started_at,
+                            int(recovery.get("attempts", 0)),
+                            cycle_started,
+                            last_replan_at,
+                        )
                     if replan_due:
                         self._publish_cmd_vel(0.0, 0.0)
                         replanned_path, replan_error = self._replan_lidar_fallback(
@@ -4981,13 +5041,20 @@ class RosBridge:
                                 routeIndex=route_index,
                                 pathLength=len(path),
                                 recoveryDurationMs=round(recovery_duration * 1000),
+                                reason=replan_reason,
+                                dynamicObstacleCount=len(dynamic_obstacles),
                             )
                             self.state.update_runtime(
                                 {
                                     "goal": route[route_index],
                                     "routeIndex": route_index,
                                     "navStatus": "fallback_replanned",
-                                    "navMessage": "LiDAR recovery persisted; A* detour path replaced.",
+                                    "navMessage": (
+                                        "LiDAR obstacle reached the active path; "
+                                        "A* detour path replaced."
+                                        if replan_reason == "dynamic_obstacle"
+                                        else "LiDAR recovery persisted; A* detour path replaced."
+                                    ),
                                     "fallbackActive": True,
                                     "fallbackPathIndex": 0,
                                     "fallbackPathLength": len(path),
@@ -5004,6 +5071,8 @@ class RosBridge:
                                 pose=pose,
                                 routeIndex=route_index,
                                 recoveryDurationMs=round(recovery_duration * 1000),
+                                reason=replan_reason,
+                                dynamicObstacleCount=len(dynamic_obstacles),
                                 error=replan_error,
                             )
                             self.state.update_runtime(
@@ -5011,7 +5080,11 @@ class RosBridge:
                                     "goal": route[route_index],
                                     "routeIndex": route_index,
                                     "navStatus": "fallback_replan_failed",
-                                    "navMessage": f"LiDAR recovery persisted; A* replan failed: {replan_error}",
+                                    "navMessage": (
+                                        f"LiDAR obstacle reached the active path; A* replan failed: {replan_error}"
+                                        if replan_reason == "dynamic_obstacle"
+                                        else f"LiDAR recovery persisted; A* replan failed: {replan_error}"
+                                    ),
                                     "fallbackActive": True,
                                     "fallbackSpeedScale": 0.0,
                                     "fallbackRecoveryPhase": "replan_failed",

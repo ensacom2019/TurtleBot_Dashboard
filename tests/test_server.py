@@ -216,13 +216,27 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_lidar_dynamic_obstacles_require_dense_points_and_transform_to_map(self) -> None:
         obstacles = server.lidar_dynamic_obstacle_cells(
-            [(1.00, 0.01), (1.01, 0.02), (1.015, 0.03), (1.018, 0.01), (0.1, 0.0)],
+            [
+                (1.00, 0.01),
+                (1.01, 0.02),
+                (1.015, 0.03),
+                (1.018, 0.01),
+                (1.017, 0.02),
+                (0.1, 0.0),
+            ],
             {"x": 0.5, "y": 0.5, "yaw": 0.0},
         )
         self.assertEqual(len(obstacles), 1)
-        self.assertEqual(obstacles[0]["points"], 4)
+        self.assertEqual(obstacles[0]["points"], 5)
         self.assertEqual(obstacles[0]["width"], server.DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE)
         self.assertGreater(obstacles[0]["x"], 1.4)
+        self.assertEqual(
+            server.lidar_dynamic_obstacle_cells(
+                [(1.00, 0.01), (1.01, 0.02), (1.015, 0.03), (1.018, 0.01)],
+                {"x": 0.5, "y": 0.5, "yaw": 0.0},
+            ),
+            [],
+        )
 
     def test_lidar_dynamic_obstacles_ignore_invalid_pose(self) -> None:
         self.assertEqual(
@@ -258,6 +272,30 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertGreater(len(path), 10)
         self.assertEqual(path[-1]["routeIndex"], 0)
+
+    def test_fallback_path_detects_dynamic_obstacle_ahead(self) -> None:
+        path = [
+            {"x": 0.0, "y": 0.0},
+            {"x": 0.25, "y": 0.0},
+            {"x": 0.50, "y": 0.0},
+        ]
+        pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        self.assertTrue(
+            server.fallback_path_hits_dynamic_obstacle(
+                path,
+                0,
+                pose,
+                [{"x": 0.25, "y": 0.0, "width": 0.08, "height": 0.08}],
+            )
+        )
+        self.assertFalse(
+            server.fallback_path_hits_dynamic_obstacle(
+                path,
+                0,
+                pose,
+                [{"x": 0.75, "y": 0.0, "width": 0.08, "height": 0.08}],
+            )
+        )
 
     def test_lidar_safety_marks_predicted_collision_without_early_recovery(self) -> None:
         footprint = {"front": 0.15, "back": 0.15, "left": 0.10, "right": 0.10}
