@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.60"
+APP_VERSION = "2026-07-15.61"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -72,6 +72,10 @@ TWIST_STAMPED_TYPE = "geometry_msgs/msg/TwistStamped"
 DEFAULT_TURTLEBOT_LENGTH = 0.18
 DEFAULT_TURTLEBOT_WIDTH = 0.14
 DEFAULT_TURTLEBOT_RADIUS = 0.114
+
+
+def normalized_camera_stream_mode(value: Any) -> str:
+    return "raw" if str(value or "").lower() == "raw" else "compressed"
 
 
 def topics_for_namespace(namespace: str, camera_style: str = "color") -> Dict[str, str]:
@@ -224,6 +228,7 @@ DEFAULT_STATE: Dict[str, Any] = {
         "navStatus": "idle",
         "navMessage": "",
         "cameraEnabled": True,
+        "cameraStream": "compressed",
         "lastCameraAt": None,
         "lastScanAt": None,
         "lastPoseAt": None,
@@ -3149,13 +3154,34 @@ class DashboardState:
                 self.camera_content_type = "image/svg+xml"
             return json.loads(json.dumps(self._state["runtime"]))
 
+    def set_camera_stream_mode(self, mode: Any) -> Dict[str, Any]:
+        stream_mode = normalized_camera_stream_mode(mode)
+        with self._lock:
+            runtime = self._state["runtime"]
+            runtime["cameraStream"] = stream_mode
+            self.camera_bytes = None
+            self.camera_content_type = "image/svg+xml"
+            runtime["lastCameraAt"] = None
+            return json.loads(json.dumps(runtime))
+
     def camera_enabled(self) -> bool:
         with self._lock:
             return bool(self._state.get("runtime", {}).get("cameraEnabled", True))
 
-    def set_camera(self, content: bytes, content_type: str) -> None:
+    def camera_stream_mode(self) -> str:
         with self._lock:
-            if not self._state.get("runtime", {}).get("cameraEnabled", True):
+            return normalized_camera_stream_mode(
+                self._state.get("runtime", {}).get("cameraStream", "compressed")
+            )
+
+    def set_camera(self, content: bytes, content_type: str, stream_mode: str) -> None:
+        with self._lock:
+            runtime = self._state.get("runtime", {})
+            if (
+                not runtime.get("cameraEnabled", True)
+                or normalized_camera_stream_mode(runtime.get("cameraStream"))
+                != normalized_camera_stream_mode(stream_mode)
+            ):
                 return
             self.camera_bytes = content
             self.camera_content_type = content_type
@@ -4225,21 +4251,21 @@ class RosBridge:
             )
 
     def _on_image(self, msg: Any) -> None:
-        if not self.state.camera_enabled():
+        if not self.state.camera_enabled() or self.state.camera_stream_mode() != "raw":
             return
         if time.monotonic() - self._last_raw_camera < 0.2:
             return
         self._last_raw_camera = time.monotonic()
         bmp = image_msg_to_bmp(msg)
         if bmp:
-            self.state.set_camera(bmp, "image/bmp")
+            self.state.set_camera(bmp, "image/bmp", "raw")
 
     def _on_compressed_image(self, msg: Any) -> None:
-        if not self.state.camera_enabled():
+        if not self.state.camera_enabled() or self.state.camera_stream_mode() != "compressed":
             return
         fmt = str(msg.format).lower()
         content_type = "image/png" if "png" in fmt else "image/jpeg"
-        self.state.set_camera(bytes(msg.data), content_type)
+        self.state.set_camera(bytes(msg.data), content_type, "compressed")
 
     def _reset_robot_clock(self) -> None:
         with self._robot_clock_lock:
@@ -7553,6 +7579,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/camera_control":
                 runtime = self.context.state.set_camera_enabled(bool(body.get("enabled", True)))
+                self._json({"ok": True, "runtime": runtime})
+                return
+            if parsed.path == "/api/camera_stream":
+                runtime = self.context.state.set_camera_stream_mode(body.get("mode"))
                 self._json({"ok": True, "runtime": runtime})
                 return
             if parsed.path == "/api/run_logs/clear":

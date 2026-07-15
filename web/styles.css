@@ -664,11 +664,43 @@ canvas {
 .camera-tools {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
 .camera-tools button {
   min-width: 92px;
+}
+
+.camera-stream-toggle {
+  display: flex;
+}
+
+.camera-stream-toggle button {
+  min-width: 0;
+  border-radius: 0;
+  padding: 7px 10px;
+}
+
+.camera-stream-toggle button:first-child {
+  border-radius: 6px 0 0 6px;
+}
+
+.camera-stream-toggle button:last-child {
+  border-radius: 0 6px 6px 0;
+}
+
+.camera-stream-toggle button + button {
+  margin-left: -1px;
+}
+
+.camera-stream-toggle button.active {
+  position: relative;
+  z-index: 1;
+  border-color: var(--accent-2);
+  background: var(--accent-2);
+  color: #07131a;
+  font-weight: 800;
 }
 
 #cameraFrame {

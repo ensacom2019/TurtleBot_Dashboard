@@ -8,6 +8,11 @@ import server
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_camera_stream_mode_defaults_to_compressed(self) -> None:
+        self.assertEqual(server.normalized_camera_stream_mode("raw"), "raw")
+        self.assertEqual(server.normalized_camera_stream_mode("Compressed"), "compressed")
+        self.assertEqual(server.normalized_camera_stream_mode("invalid"), "compressed")
+
     def test_default_map_matches_saved_map_setup(self) -> None:
         setup = server.DEFAULT_STATE["setup"]
         self.assertEqual(setup["map"]["imageUrl"], "/data/Sprite-1.png")

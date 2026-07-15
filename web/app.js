@@ -172,6 +172,8 @@ function bindElements() {
     "mapEditorStatus",
     "cameraFrame",
     "cameraStamp",
+    "cameraRawButton",
+    "cameraCompressedButton",
     "cameraToggleButton",
     "goalX",
     "goalY",
@@ -259,6 +261,8 @@ function bindActions() {
   els.cancelGoalButton.addEventListener("click", () => postJson("/api/cancel", {}).then(showResult));
   els.stopButton.addEventListener("click", stopAllMotion);
   els.cameraToggleButton.addEventListener("click", toggleCamera);
+  els.cameraRawButton.addEventListener("click", () => setCameraStreamMode("raw"));
+  els.cameraCompressedButton.addEventListener("click", () => setCameraStreamMode("compressed"));
   document.querySelectorAll("[data-setup-tool]").forEach((button) => {
     button.addEventListener("click", () => setSetupTool(button.dataset.setupTool));
   });
@@ -649,9 +653,14 @@ function fillRuntime(runtime) {
 
 function updateCameraUi(runtime = state.data?.runtime || {}) {
   const enabled = runtime.cameraEnabled !== false;
+  const streamMode = runtime.cameraStream === "raw" ? "raw" : "compressed";
   state.cameraEnabled = enabled;
   els.cameraToggleButton.textContent = enabled ? "카메라 끄기" : "카메라 켜기";
   els.cameraToggleButton.classList.toggle("active", enabled);
+  els.cameraRawButton.classList.toggle("active", streamMode === "raw");
+  els.cameraCompressedButton.classList.toggle("active", streamMode === "compressed");
+  els.cameraRawButton.setAttribute("aria-pressed", String(streamMode === "raw"));
+  els.cameraCompressedButton.setAttribute("aria-pressed", String(streamMode === "compressed"));
   els.cameraFrame.classList.toggle("camera-off", !enabled);
   els.cameraStamp.textContent = enabled ? runtime.lastCameraAt || "-" : "OFF";
   if (!enabled && els.cameraFrame.dataset.cameraState !== "off") {
@@ -721,6 +730,27 @@ async function toggleCamera() {
     toast(error.message);
   } finally {
     els.cameraToggleButton.disabled = false;
+  }
+}
+
+async function setCameraStreamMode(mode) {
+  if (mode !== "raw" && mode !== "compressed") return;
+  els.cameraRawButton.disabled = true;
+  els.cameraCompressedButton.disabled = true;
+  try {
+    const payload = await postJson("/api/camera_stream", { mode });
+    const runtime = payload.runtime || { ...(state.data?.runtime || {}), cameraStream: mode };
+    if (state.data?.runtime) {
+      state.data.runtime = { ...state.data.runtime, ...runtime };
+    }
+    updateCameraUi(runtime);
+    els.cameraFrame.src = `/api/camera/frame?t=${Date.now()}`;
+    toast(mode === "raw" ? "Raw 카메라 스트림으로 전환했습니다." : "Compressed 카메라 스트림으로 전환했습니다.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    els.cameraRawButton.disabled = false;
+    els.cameraCompressedButton.disabled = false;
   }
 }
 
