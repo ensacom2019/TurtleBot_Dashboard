@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.66"
+APP_VERSION = "2026-07-15.67"
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -322,6 +322,32 @@ def normalized_robot_map_pose(map_pose: Any) -> Dict[str, Any]:
     return values
 
 
+def fresh_runtime_state(setup: Dict[str, Any], previous_runtime: Any = None) -> Dict[str, Any]:
+    """Discard stale sensor/navigation data while retaining local camera preferences."""
+    previous = previous_runtime if isinstance(previous_runtime, dict) else {}
+    runtime = json.loads(json.dumps(DEFAULT_STATE["runtime"]))
+    runtime.update(
+        {
+            "appVersion": APP_VERSION,
+            "pose": None,
+            "goal": None,
+            "route": [],
+            "routeIndex": 0,
+            "routeRepeatEnabled": False,
+            "routeRepeatCycle": 0,
+            "routeRepeatResumeAt": None,
+            "navStatus": "idle",
+            "navMessage": "Dashboard restarted; waiting for ROS2 data.",
+            "cameraEnabled": bool(previous.get("cameraEnabled", True)),
+            "cameraStream": normalized_camera_stream_mode(
+                previous.get("cameraStream", "compressed")
+            ),
+        }
+    )
+    _ = setup
+    return runtime
+
+
 def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
     """Keep only TurtleBot 2 initially; retain profiles added by robot discovery."""
     setup = state.setdefault("setup", {})
@@ -361,7 +387,17 @@ def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
     if active_robot not in profiles:
         active_robot = "tb3_2"
         setup["activeRobot"] = active_robot
-        setup["topics"] = dict(profiles[active_robot].get("topics") or {})
+    active_profile = profiles[active_robot]
+    if not isinstance(active_profile.get("topics"), dict):
+        fallback_topics = setup.get("topics")
+        active_profile["topics"] = (
+            dict(fallback_topics)
+            if isinstance(fallback_topics, dict)
+            else dict(DEFAULT_ROBOT_PROFILES["tb3_2"]["topics"])
+        )
+    # setup.topics remains an in-memory compatibility view. Robot profile topics
+    # are the persisted source of truth for the selected robot.
+    setup["topics"] = dict(active_profile["topics"])
     return state
 
 
@@ -3132,31 +3168,46 @@ class DashboardState:
         self.camera_bytes: Optional[bytes] = None
         self.camera_content_type = "image/svg+xml"
         self._camera_frame_times: deque[float] = deque(maxlen=60)
-        if detected_server_ip:
-            self.save()
+        self.save()
 
     def _load(self) -> Dict[str, Any]:
         if SETTINGS_PATH.exists():
             try:
                 data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
                 state = normalize_robot_profiles_state(deep_merge(DEFAULT_STATE, data))
-                state.setdefault("runtime", {})["appVersion"] = APP_VERSION
+                legacy_setup = data.get("setup") if isinstance(data, dict) else {}
+                legacy_topics = (
+                    legacy_setup.get("topics") if isinstance(legacy_setup, dict) else None
+                )
+                if isinstance(legacy_topics, dict):
+                    migration = {"topics": legacy_topics}
+                    synchronize_active_robot_topics(migration, state["setup"])
+                    state["setup"] = deep_merge(state["setup"], migration)
+                    state = normalize_robot_profiles_state(state)
+                state["runtime"] = fresh_runtime_state(
+                    state["setup"], data.get("runtime") if isinstance(data, dict) else None
+                )
                 return state
             except Exception:
                 state = normalize_robot_profiles_state(json.loads(json.dumps(DEFAULT_STATE)))
-                state.setdefault("runtime", {})["appVersion"] = APP_VERSION
+                state["runtime"] = fresh_runtime_state(state["setup"])
                 return state
         state = normalize_robot_profiles_state(json.loads(json.dumps(DEFAULT_STATE)))
-        state.setdefault("runtime", {})["appVersion"] = APP_VERSION
+        state["runtime"] = fresh_runtime_state(state["setup"])
         return state
 
     def save(self) -> None:
         CONFIG_ROOT.mkdir(exist_ok=True)
         with self._lock:
             persisted = json.loads(json.dumps(self._state))
+            persisted.setdefault("setup", {}).pop("topics", None)
             persisted_runtime = persisted.setdefault("runtime", {})
-            persisted_runtime.pop("lidarPoints", None)
-            persisted_runtime.pop("lidarPose", None)
+            persisted["runtime"] = {
+                "cameraEnabled": bool(persisted_runtime.get("cameraEnabled", True)),
+                "cameraStream": normalized_camera_stream_mode(
+                    persisted_runtime.get("cameraStream", "compressed")
+                ),
+            }
             SETTINGS_PATH.write_text(
                 json.dumps(persisted, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -3221,6 +3272,16 @@ class DashboardState:
         if "network" in patch:
             self.refresh_server_ip()
             return self.snapshot()
+        return snapshot
+
+    def replace_setup(self, setup: Dict[str, Any]) -> Dict[str, Any]:
+        """Restore a setup snapshot after a failed live ROS reconfiguration."""
+        with self._lock:
+            self._state["setup"] = json.loads(json.dumps(setup))
+            self._state = normalize_robot_profiles_state(self._state)
+            snapshot = json.loads(json.dumps(self._state))
+        self.save()
+        self.log_run_event("setup_restored", activeRobot=snapshot["setup"].get("activeRobot"))
         return snapshot
 
     def update_runtime(self, patch: Dict[str, Any]) -> None:
@@ -4113,11 +4174,6 @@ class RosBridge:
 
     def reload_setup(self) -> Dict[str, Any]:
         next_setup = self.state.get_setup()
-        if self._is_fallback():
-            self.setup = next_setup
-            self.topics = self.setup["topics"]
-            return {"ok": True, "mode": "offline-preview", "message": "ROS bridge settings updated."}
-
         self._clear_manual_watchdog()
         self._stop_lidar_fallback(publish_stop=False)
         try:
@@ -4127,6 +4183,10 @@ class RosBridge:
         old_node = self.node
         self.goal_handle = None
         self.route_goal_handle = None
+        fallback = getattr(self, "_fallback", None)
+        if fallback is not None:
+            fallback.shutdown()
+            del self._fallback
         with self._publisher_lock:
             try:
                 if old_node is not None:
@@ -4164,7 +4224,11 @@ class RosBridge:
         return {
             "ok": not self._is_fallback(),
             "mode": "offline-preview" if self._is_fallback() else "ros2",
-            "message": "ROS bridge reloaded with updated topics.",
+            "message": (
+                "ROS bridge reloaded with updated topics."
+                if not self._is_fallback()
+                else f"ROS bridge reload failed: {getattr(self, '_fallback_reason', 'unknown error')}"
+            ),
         }
 
     def _on_pose(self, msg: Any) -> None:
@@ -7445,6 +7509,7 @@ class AppContext:
 
 
 class DashboardHttpServer(ThreadingHTTPServer):
+    allow_reuse_address = False
     daemon_threads = True
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -7707,6 +7772,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 synchronize_active_robot_topics(patch, setup)
                 self.context.state.update_setup(patch)
                 result["rosReload"] = self.context.ros.reload_setup()
+                if not result["rosReload"].get("ok"):
+                    self.context.state.replace_setup(setup)
+                    rollback = self.context.ros.reload_setup()
+                    raise ValueError(
+                        "Topic settings were restored because ROS bridge reload failed. "
+                        f"Reload: {result['rosReload'].get('message')}; "
+                        f"rollback: {rollback.get('message')}"
+                    )
                 result["state"] = self.context.state.public_snapshot()
                 self._json(result)
                 return
@@ -8003,7 +8076,16 @@ def main() -> None:
     state = DashboardState()
     ros = RosBridge(state)
     DashboardHandler.context = AppContext(state=state, ros=ros)
-    server = DashboardHttpServer((args.host, args.port), DashboardHandler)
+    try:
+        server = DashboardHttpServer((args.host, args.port), DashboardHandler)
+    except OSError as exc:
+        ros.shutdown()
+        state.run_logs.close()
+        raise SystemExit(
+            f"Dashboard could not start on {args.host}:{args.port}. "
+            "Stop the existing dashboard process before starting a new one. "
+            f"({exc})"
+        ) from exc
     print(f"TurtleBot3 web dashboard: http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

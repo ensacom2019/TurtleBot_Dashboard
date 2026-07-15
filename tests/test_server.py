@@ -189,6 +189,41 @@ class ServerHelpersTest(unittest.TestCase):
             "/camera/image_raw/compressed",
         )
 
+    def test_active_profile_topics_are_the_canonical_runtime_topic_view(self) -> None:
+        state = server.deep_merge(
+            server.DEFAULT_STATE,
+            {
+                "setup": {
+                    "topics": {"camera": "/stale/camera"},
+                    "robotProfiles": {
+                        "tb3_2": {"topics": {"camera": "/camera/image_raw"}}
+                    },
+                }
+            },
+        )
+        normalized = server.normalize_robot_profiles_state(state)
+        self.assertEqual(normalized["setup"]["topics"]["camera"], "/camera/image_raw")
+
+    def test_fresh_runtime_state_discards_stale_navigation_and_sensor_data(self) -> None:
+        runtime = server.fresh_runtime_state(
+            server.DEFAULT_STATE["setup"],
+            {
+                "pose": {"x": 1.0, "y": 2.0, "yaw": 0.5},
+                "navStatus": "moving",
+                "lastScanAt": "old",
+                "cameraEnabled": False,
+                "cameraStream": "raw",
+            },
+        )
+        self.assertIsNone(runtime["pose"])
+        self.assertEqual(runtime["navStatus"], "idle")
+        self.assertIsNone(runtime["lastScanAt"])
+        self.assertFalse(runtime["cameraEnabled"])
+        self.assertEqual(runtime["cameraStream"], "raw")
+
+    def test_dashboard_server_disallows_address_reuse(self) -> None:
+        self.assertFalse(server.DashboardHttpServer.allow_reuse_address)
+
     def test_detected_candidate_topics_keeps_only_existing_graph_entries(self) -> None:
         candidate = {
             "recommendedTopics": {

@@ -787,6 +787,9 @@ async function resetTopicsFromRobot() {
   els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>활성 로봇의 ROS2 토픽을 검색 중...</p></div>`;
   try {
     const payload = await postJson("/api/topics/reset", { activeRobot });
+    if (payload.rosReload?.ok === false) {
+      throw new Error(payload.rosReload.message || "ROS 브릿지 재로딩에 실패했습니다.");
+    }
     state.setupDirty = false;
     if (payload.state) applyState(payload.state);
     const found = Object.entries(payload.topics || {})
