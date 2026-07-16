@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-16.79"
+APP_VERSION = "2026-07-16.80"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -266,6 +266,9 @@ DEFAULT_STATE: Dict[str, Any] = {
         "cameraEnabled": True,
         "cameraStream": "compressed",
         "cameraFps": None,
+        "cameraSubscriptionTopic": None,
+        "cameraSubscriptionQueueDepth": None,
+        "cameraExecutorThreads": None,
         "lastCameraAt": None,
         "lastScanAt": None,
         "lastPoseAt": None,
@@ -3548,6 +3551,11 @@ def format_diagnostics_report(
                 "routeIndex": runtime.get("routeIndex"),
                 "routeCheckpoint": runtime.get("routeCheckpoint"),
                 "cameraEnabled": runtime.get("cameraEnabled"),
+                "cameraStream": runtime.get("cameraStream"),
+                "cameraFps": runtime.get("cameraFps"),
+                "cameraSubscriptionTopic": runtime.get("cameraSubscriptionTopic"),
+                "cameraSubscriptionQueueDepth": runtime.get("cameraSubscriptionQueueDepth"),
+                "cameraExecutorThreads": runtime.get("cameraExecutorThreads"),
                 "lastScanAt": runtime.get("lastScanAt"),
                 "lastPoseAt": runtime.get("lastPoseAt"),
                 "lastOdomAt": runtime.get("lastOdomAt"),
@@ -4454,6 +4462,12 @@ class NullRosBridge:
             }
         )
 
+    def set_camera_enabled(self, enabled: bool) -> Dict[str, Any]:
+        return self.state.set_camera_enabled(enabled)
+
+    def set_camera_stream_mode(self, mode: Any) -> Dict[str, Any]:
+        return self.state.set_camera_stream_mode(mode)
+
     def set_initial_pose(self, x: float, y: float, yaw: float) -> Dict[str, Any]:
         self.state.log_run_event("initial_pose_requested", pose={"x": x, "y": y, "yaw": yaw})
         self.state.update_runtime(
@@ -4924,6 +4938,10 @@ class RosBridge:
         self._odom_anchor: Optional[Dict[str, Tuple[float, float, float]]] = None
         self._pending_odom_anchor: Optional[Tuple[float, float, float]] = None
         self._last_raw_camera = 0.0
+        self._camera_subscription_lock = threading.RLock()
+        self._camera_subscription = None
+        self._camera_subscription_mode: Optional[str] = None
+        self._camera_callback_group = None
         self._last_amcl = 0.0
         self._last_lidar_display = 0.0
         self._last_sensor_run_log = 0.0
@@ -4965,10 +4983,17 @@ class RosBridge:
             from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped
             from nav_msgs.msg import Odometry
             from rclpy.action import ActionClient
+            from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
             from rclpy.context import Context
-            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.executors import MultiThreadedExecutor
             from rclpy.node import Node
-            from rclpy.qos import qos_profile_sensor_data
+            from rclpy.qos import (
+                DurabilityPolicy,
+                HistoryPolicy,
+                QoSProfile,
+                ReliabilityPolicy,
+                qos_profile_sensor_data,
+            )
             from sensor_msgs.msg import CompressedImage, Image, LaserScan
 
             try:
@@ -4985,9 +5010,17 @@ class RosBridge:
         self.PoseWithCovarianceStamped = PoseWithCovarianceStamped
         self.Twist = Twist
         self.TwistStamped = TwistStamped
+        self.Image = Image
+        self.CompressedImage = CompressedImage
         self.NavigateToPose = NavigateToPose
         self.NavigateThroughPoses = NavigateThroughPoses
         self.sensor_qos = qos_profile_sensor_data
+        self.camera_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
 
         _robot_id, profile = active_robot_profile(self.setup)
         connection = profile.get("connection") if isinstance(profile.get("connection"), dict) else {}
@@ -4999,8 +5032,9 @@ class RosBridge:
             pass
 
         self.node = DashboardNode("turtlebot_web_dashboard", context=self.ros_context)
-        self.ros_executor = SingleThreadedExecutor(context=self.ros_context)
+        self.ros_executor = MultiThreadedExecutor(num_threads=2, context=self.ros_context)
         self.ros_executor.add_node(self.node)
+        self._camera_callback_group = MutuallyExclusiveCallbackGroup()
         qos = 10
         self.initial_pose_pub = self.node.create_publisher(
             PoseWithCovarianceStamped, self.topics["initialPose"], qos
@@ -5017,10 +5051,7 @@ class RosBridge:
         self.node.create_subscription(
             LaserScan, self.topics.get("scan", "/scan"), self._on_scan, self.sensor_qos
         )
-        self.node.create_subscription(Image, self.topics["camera"], self._on_image, self.sensor_qos)
-        self.node.create_subscription(
-            CompressedImage, self.topics["compressedCamera"], self._on_compressed_image, self.sensor_qos
-        )
+        self._configure_camera_subscription(self.state.camera_stream_mode())
         self.action_client = (
             ActionClient(self.node, NavigateToPose, self.topics["goalAction"])
             if NavigateToPose is not None
@@ -5086,6 +5117,67 @@ class RosBridge:
     def _is_fallback(self) -> bool:
         return hasattr(self, "_fallback")
 
+    def _configure_camera_subscription(self, mode: Any) -> None:
+        stream_mode = normalized_camera_stream_mode(mode)
+        active_topic: Optional[str] = None
+        with self._camera_subscription_lock:
+            if self.node is None:
+                return
+            enabled = self.state.camera_enabled()
+            if (
+                enabled
+                and self._camera_subscription is not None
+                and self._camera_subscription_mode == stream_mode
+            ):
+                return
+
+            previous = self._camera_subscription
+            self._camera_subscription = None
+            if previous is not None:
+                self.node.destroy_subscription(previous)
+
+            self._camera_subscription_mode = stream_mode
+            if enabled:
+                if stream_mode == "raw":
+                    message_type = self.Image
+                    topic = self.topics["camera"]
+                    callback = self._on_image
+                else:
+                    message_type = self.CompressedImage
+                    topic = self.topics["compressedCamera"]
+                    callback = self._on_compressed_image
+                active_topic = topic
+                self._camera_subscription = self.node.create_subscription(
+                    message_type,
+                    topic,
+                    callback,
+                    self.camera_qos,
+                    callback_group=self._camera_callback_group,
+                )
+            if self.ros_executor is not None:
+                self.ros_executor.wake()
+        self.state.update_runtime(
+            {
+                "cameraSubscriptionTopic": active_topic,
+                "cameraSubscriptionQueueDepth": 1 if enabled else None,
+                "cameraExecutorThreads": 2,
+            }
+        )
+
+    def set_camera_enabled(self, enabled: bool) -> Dict[str, Any]:
+        if self._is_fallback():
+            return self._fallback.set_camera_enabled(enabled)
+        runtime = self.state.set_camera_enabled(enabled)
+        self._configure_camera_subscription(runtime.get("cameraStream"))
+        return runtime
+
+    def set_camera_stream_mode(self, mode: Any) -> Dict[str, Any]:
+        if self._is_fallback():
+            return self._fallback.set_camera_stream_mode(mode)
+        runtime = self.state.set_camera_stream_mode(mode)
+        self._configure_camera_subscription(runtime.get("cameraStream"))
+        return runtime
+
     def reload_setup(self) -> Dict[str, Any]:
         next_setup = self.state.get_setup()
         self._clear_manual_watchdog()
@@ -5127,6 +5219,9 @@ class RosBridge:
         self.node = None
         self.action_client = None
         self.route_action_client = None
+        self._camera_subscription = None
+        self._camera_subscription_mode = None
+        self._camera_callback_group = None
         self._last_raw_camera = 0.0
         self._last_amcl = 0.0
         self._last_lidar_display = 0.0
@@ -9000,11 +9095,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(self.context.ros.manual_drive_check())
                 return
             if parsed.path == "/api/camera_control":
-                runtime = self.context.state.set_camera_enabled(bool(body.get("enabled", True)))
+                runtime = self.context.ros.set_camera_enabled(bool(body.get("enabled", True)))
                 self._json({"ok": True, "runtime": runtime})
                 return
             if parsed.path == "/api/camera_stream":
-                runtime = self.context.state.set_camera_stream_mode(body.get("mode"))
+                runtime = self.context.ros.set_camera_stream_mode(body.get("mode"))
                 self._json({"ok": True, "runtime": runtime})
                 return
             if parsed.path == "/api/run_logs/clear":

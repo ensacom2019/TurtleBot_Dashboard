@@ -2,7 +2,7 @@
 
 TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지도 설정, A* 경로 계획, LiDAR 기반 비상 주행, 수동 운전, 카메라 확인, 로봇 SSH 브링업을 한 화면에서 다룹니다.
 
-현재 문서 기준 버전은 `2026-07-16.79`입니다.
+현재 문서 기준 버전은 `2026-07-16.80`입니다.
 
 ## 다중 로봇 (서로 다른 ROS Domain)
 
@@ -41,7 +41,8 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 - 핑크 표시 반경과 본체 충돌 반경을 분리하고 흰색 자유 공간을 우선하는 A* 경로 계획
 - Nav2 사용 가능 시 Nav2 실행, 불가능 시 LiDAR A* 직접 추종 사용
 - LiDAR 점 표시와 본체 외곽 거리 기반 감속/회피
-- 카메라 화면, 수동 주행, 주행 로그, 진단 보고서
+- Raw/Compressed 카메라 선택, 선택 토픽 단일 구독과 최신 프레임 MJPEG 표시
+- 수동 주행, 주행 로그, 진단 보고서
 - ROS 2 토픽 설정, 로봇 탭 선택, 같은 사설 네트워크의 SSH 장비 및 ROS 로봇 검색, 로봇 체크
 - SSH 브링업: OpenCR 포트 검증 후 systemd 사용자 서비스로 TurtleBot base를 실행하고 Nav2/AMCL, 카메라를 시작
 - SSH 브링업 종료: Nav2 lifecycle shutdown과 Ctrl+C(SIGINT) 후 검증을 거쳐 base·LiDAR·Nav2·카메라를 정상 종료
@@ -178,7 +179,9 @@ ROS spin stopped: spin() got an unexpected keyword argument 'context'
 
 주행 탭의 Raw/Compressed 선택과 셋업 토픽이 실제 ROS graph와 일치해야 합니다. 기본값은 `/camera/image_raw`와 `/camera/image_raw/compressed`입니다. 카메라 보정 YAML 누락 경고는 거리 보정 정보가 없다는 뜻이며 영상 publisher가 정상이라면 프레임 수신 자체를 막지는 않습니다.
 
-Raw 모드는 Python BMP 변환과 네트워크 부하를 제한하기 위해 최대 약 5 FPS로 샘플링합니다. Compressed 모드는 `2026-07-16.75`부터 반복 HTTP 폴링 대신 최신 JPEG를 즉시 전달하는 MJPEG 스트림을 사용합니다. 입력 토픽이 30 FPS이고 네트워크와 브라우저 디코딩 성능이 충분하면 화면 표시 24 FPS 이상을 목표로 하며, 느린 클라이언트에는 오래된 프레임을 쌓지 않고 최신 프레임으로 건너뜁니다.
+Raw 모드는 Python BMP 변환과 네트워크 부하를 제한하기 위해 최대 약 5 FPS로 샘플링합니다. Compressed 모드는 반복 HTTP 폴링 대신 최신 JPEG를 즉시 전달하는 MJPEG 스트림을 사용합니다. `2026-07-16.80`부터 선택한 Raw 또는 Compressed 토픽 하나만 구독하고, 1프레임 QoS 큐와 전용 callback group으로 LiDAR 처리 중에도 최신 영상을 우선합니다. 표시 FPS의 상한은 카메라 publisher의 실제 발행 속도이며, 네트워크와 브라우저 디코딩 성능이 충분하면 RQT에서 측정한 Compressed 토픽 속도에 가깝게 표시됩니다.
+
+진단 보고서의 `cameraSubscriptionTopic`, `cameraSubscriptionQueueDepth`, `cameraExecutorThreads`, `cameraFps`로 실제 구독 토픽과 대시보드 수신 속도를 확인할 수 있습니다. Compressed 모드에서는 큐 깊이 `1`, executor 스레드 `2`, 설정한 Compressed 토픽이 표시되어야 합니다.
 
 ### Nav2 action server가 없을 때
 

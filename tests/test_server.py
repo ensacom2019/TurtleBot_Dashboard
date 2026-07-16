@@ -35,7 +35,10 @@ class ServerHelpersTest(unittest.TestCase):
         monitor_start = inspect.getsource(server.RobotPoseMonitor._start)
         monitor_spin = inspect.getsource(server.RobotPoseMonitor._spin)
 
-        self.assertIn("SingleThreadedExecutor(context=self.ros_context)", bridge_init)
+        self.assertIn(
+            "MultiThreadedExecutor(num_threads=2, context=self.ros_context)", bridge_init
+        )
+        self.assertIn("MutuallyExclusiveCallbackGroup", bridge_init)
         self.assertIn("SingleThreadedExecutor(context=self.context)", monitor_start)
         self.assertIn("executor.spin()", bridge_spin)
         self.assertIn("self.executor.spin()", monitor_spin)
@@ -98,6 +101,81 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("multipart/x-mixed-replace", source)
         self.assertIn("wait_for_camera_frame", source)
         self.assertIn("next_sequence == sequence", source)
+
+    def test_camera_subscription_switch_keeps_only_selected_transport(self) -> None:
+        created = []
+        destroyed = []
+        wake_calls = []
+
+        class FakeNode:
+            def create_subscription(
+                self, message_type, topic, callback, qos, callback_group=None
+            ):
+                subscription = {
+                    "messageType": message_type,
+                    "topic": topic,
+                    "callback": callback,
+                    "qos": qos,
+                    "callbackGroup": callback_group,
+                }
+                created.append(subscription)
+                return subscription
+
+            def destroy_subscription(self, subscription):
+                destroyed.append(subscription)
+                return True
+
+        class FakeState:
+            enabled = True
+            runtime_updates = []
+
+            def camera_enabled(self):
+                return self.enabled
+
+            def update_runtime(self, patch):
+                self.runtime_updates.append(patch)
+
+        bridge = object.__new__(server.RosBridge)
+        bridge._camera_subscription_lock = server.threading.RLock()
+        bridge._camera_subscription = None
+        bridge._camera_subscription_mode = None
+        bridge._camera_callback_group = object()
+        bridge.node = FakeNode()
+        bridge.state = FakeState()
+        bridge.Image = "Image"
+        bridge.CompressedImage = "CompressedImage"
+        bridge.camera_qos = "latest-frame-qos"
+        bridge.topics = {
+            "camera": "/camera/image_raw",
+            "compressedCamera": "/camera/image_raw/compressed",
+        }
+        bridge.ros_executor = SimpleNamespace(wake=lambda: wake_calls.append(True))
+
+        bridge._configure_camera_subscription("compressed")
+        bridge._configure_camera_subscription("raw")
+        bridge.state.enabled = False
+        bridge._configure_camera_subscription("raw")
+
+        self.assertEqual(
+            [subscription["topic"] for subscription in created],
+            ["/camera/image_raw/compressed", "/camera/image_raw"],
+        )
+        self.assertEqual(destroyed, created)
+        self.assertIsNone(bridge._camera_subscription)
+        self.assertEqual(len(wake_calls), 3)
+        self.assertEqual(
+            bridge.state.runtime_updates[-1],
+            {
+                "cameraSubscriptionTopic": None,
+                "cameraSubscriptionQueueDepth": None,
+                "cameraExecutorThreads": 2,
+            },
+        )
+
+    def test_camera_controls_reconfigure_ros_subscription(self) -> None:
+        source = inspect.getsource(server.DashboardHandler.do_POST)
+        self.assertIn("self.context.ros.set_camera_enabled", source)
+        self.assertIn("self.context.ros.set_camera_stream_mode", source)
 
     def test_default_map_matches_saved_map_setup(self) -> None:
         setup = server.DEFAULT_STATE["setup"]
