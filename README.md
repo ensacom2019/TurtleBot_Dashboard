@@ -2,9 +2,11 @@
 
 TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지도 설정, A* 경로 계획, LiDAR 기반 비상 주행, 수동 운전, 카메라 확인, 로봇 SSH 브링업을 한 화면에서 다룹니다.
 
+현재 문서 기준 버전은 `2026-07-16.74`입니다.
+
 ## 다중 로봇 (서로 다른 ROS Domain)
 
-자동 네트워크 검색은 사용하지 않습니다. 셋업의 `+` 버튼으로 로봇 프로필을 직접 추가하고, **각 프로필별로** Robot IP, SSH Host/User/Password, `ROS_DOMAIN_ID`를 입력해 저장합니다. 각 로봇은 반드시 서로 다른 Domain을 사용하며, 토픽 이름은 모두 `/scan`, `/amcl_pose`처럼 같아도 됩니다.
+처음에는 기본 프로필인 `TurtleBot 2`만 표시됩니다. Active Robot 옆 검색 버튼으로 같은 사설 네트워크의 ROS/SSH 후보를 검색하면 발견된 로봇을 프로필로 추가할 수 있습니다. 검색되지 않는 로봇은 셋업의 `+` 버튼으로 직접 추가하고, **각 프로필별로** Robot IP, SSH Host/User/Password, `ROS_DOMAIN_ID`를 입력해 저장합니다. 로봇별 Domain을 분리하면 토픽 이름은 모두 `/scan`, `/amcl_pose`처럼 같아도 됩니다.
 
 프로필을 선택하면 그 로봇만 제어 대상이 됩니다. `선택 로봇 브링업`과 `선택 로봇 종료`는 선택한 프로필의 SSH와 Domain으로만 동작합니다. 다른 프로필은 Domain별 ROS worker가 pose를 구독하여 지도상의 회피 장애물로 반영하며, pose를 아직 받지 못한 경우에는 수동 위치값을 사용합니다.
 
@@ -61,6 +63,14 @@ chmod +x run_ubuntu.sh stop_dashboard.sh stop_robot.sh check_camera.sh
 ./run_ubuntu.sh
 ```
 
+기존 설치를 최신 코드로 갱신할 때는 실행 중인 대시보드를 종료한 뒤 코드를 받고 다시 시작합니다.
+
+```bash
+./stop_dashboard.sh
+git pull origin main
+./run_ubuntu.sh
+```
+
 또는 직접 실행합니다.
 
 ```bash
@@ -102,9 +112,21 @@ python server.py --host 127.0.0.1 --port 8080
 | 초기 위치 | `/initialpose` |
 | 단일 목표 | `/navigate_to_pose` |
 | 경유지 목표 | `/navigate_through_poses` |
-| 카메라 | `/camera/image_raw` |
+| 카메라 Raw | `/camera/image_raw` |
+| 카메라 Compressed | `/camera/image_raw/compressed` |
 
-`tb3_1` 프로필은 `/tb3_1/...` namespace를 사용합니다. 토픽명과 네트워크 값은 셋업 탭에서 변경할 수 있습니다.
+검색 또는 직접 추가한 로봇이 namespace를 사용한다면 해당 프로필 토픽을 `/tb3_1/scan`, `/tb3_1/odom` 같은 형식으로 설정합니다. 토픽명과 네트워크 값은 셋업 탭에서 변경할 수 있으며, `토픽 초기화`는 현재 ROS graph에서 발견한 토픽으로 다시 채웁니다.
+
+## ROS 2 브릿지
+
+`server.py`의 ROS 브릿지는 다중 로봇 중계기가 아니라 웹 브라우저와 ROS 2 graph를 연결하는 백엔드 노드입니다. 로봇이 한 대여도 다음 흐름에 필요합니다.
+
+```text
+웹 브라우저 -> HTTP API -> server.py/rclpy -> /cmd_vel, 목표 및 초기 위치
+웹 브라우저 <- HTTP API <- server.py/rclpy <- /scan, /odom, 카메라
+```
+
+ROS 2 Jazzy에서는 각 ROS `Context`에 연결한 `SingleThreadedExecutor`가 LiDAR, odometry, 카메라와 action callback을 처리합니다. 브릿지의 spin이 멈추면 직접 publisher를 호출하는 수동주행은 될 수 있지만 센서 화면과 A* 직접 추종은 함께 멈춥니다. 실제 로봇 연결 시 셋업 또는 진단 화면에서 `mode: ros2`, `rosConnected: true`인지 확인하세요. `offline-preview`는 Windows UI 프리뷰용 상태입니다.
 
 ## 운행 방식
 
@@ -115,6 +137,31 @@ python server.py --host 127.0.0.1 --port 8080
 5. LiDAR 점이 본체 외곽 3cm 이내로 들어오면 빈 방향을 찾아 회피합니다. 감속 구간에서는 설정된 감속 속도로 일정하게 주행합니다.
 
 실제 주행 전에는 낮은 속도와 넓은 안전 여유로 테스트하고, `/scan`, `/odom`, TF, `/cmd_vel` 수신 상태를 로봇 체크에서 확인하세요.
+
+## 문제 해결
+
+### 수동주행만 되고 LiDAR·카메라·자율주행이 안 될 때
+
+진단 보고서와 주행 로그에서 `ros_error`, `rosBridgeError`, `lastScanAt`, `lastOdomAt`, `lastCameraAt`을 확인합니다. `2026-07-16.73`까지 발생할 수 있던 다음 오류는 `2026-07-16.74`에서 Jazzy executor 방식으로 수정됐습니다.
+
+```text
+ROS spin stopped: spin() got an unexpected keyword argument 'context'
+```
+
+최신 코드를 받은 뒤 대시보드를 재시작하고 다음 상태를 확인합니다.
+
+- 진단의 `mode`가 `ros2`이고 `rosBridgeError`가 비어 있음
+- `/scan`, `/odom`에 publisher가 있고 `lastScanAt`, `lastOdomAt`이 갱신됨
+- 선택한 Raw 또는 Compressed 카메라 토픽에 publisher가 있고 `lastCameraAt`과 FPS가 갱신됨
+- A* 직접 주행 시작 시 `fallback_waiting_sensors`가 계속 유지되지 않음
+
+### 카메라 토픽은 있지만 화면이 안 나올 때
+
+주행 탭의 Raw/Compressed 선택과 셋업 토픽이 실제 ROS graph와 일치해야 합니다. 기본값은 `/camera/image_raw`와 `/camera/image_raw/compressed`입니다. 카메라 보정 YAML 누락 경고는 거리 보정 정보가 없다는 뜻이며 영상 publisher가 정상이라면 프레임 수신 자체를 막지는 않습니다.
+
+### Nav2 action server가 없을 때
+
+`/navigate_to_pose`와 `/navigate_through_poses` action server가 없으면 Nav2 방식은 사용할 수 없습니다. 주행 탭의 `LiDAR 비상주행 준비 -> A* 경로 직접 추종` 토글을 사용하면 Nav2 없이도 이동할 수 있지만, 최신 `/scan`과 `/odom` 데이터는 반드시 필요합니다. SSH 로그에 `navigation2.launch.py` 파일 누락이 보이면 로봇의 TurtleBot3 Navigation2 패키지 또는 launch 경로를 별도로 수정해야 합니다.
 
 ## 로봇 SSH 브링업
 
