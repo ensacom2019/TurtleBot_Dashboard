@@ -135,6 +135,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(path)
         self.assertTrue(all(cell not in soft for cell in path))
 
+    def test_fallback_astar_prefers_long_white_route_over_soft_crossing(self) -> None:
+        soft = {(5, y) for y in range(5)}
+        path = server.fallback_astar_cells(
+            (0, 0), (10, 0), set(), cols=11, rows=6, soft=soft
+        )
+        self.assertTrue(path)
+        self.assertTrue(all(cell not in soft for cell in path))
+        self.assertIn((5, 5), path)
+
     def test_default_robot_profile_only_contains_turtlebot_2(self) -> None:
         profiles = server.DEFAULT_STATE["setup"]["robotProfiles"]
         self.assertEqual(list(profiles), ["tb3_2"])

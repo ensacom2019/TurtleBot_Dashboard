@@ -36,6 +36,8 @@ const state = {
   },
 };
 
+const ASTAR_SOFT_CELL_MULTIPLIER = 12;
+
 const DEFAULT_ROBOT_PROFILES = {
   tb3_2: {
     label: "TurtleBot 2",
@@ -2379,11 +2381,14 @@ function effectiveFootprint(setup) {
   };
 }
 
-function plannerClearanceRadius(setup) {
-  const footprint = effectiveFootprint(setup);
+function configuredClearanceRadius(setup) {
   const configured = Number(setup.planner?.hardClearance);
   const clearance = Number.isFinite(configured) ? Math.max(0.05, configured) : 0.05;
-  return Math.max(0, footprint.radius + clearance + (Number(setup.object?.inflation) || 0));
+  return Math.max(0, clearance + (Number(setup.object?.inflation) || 0));
+}
+
+function plannerClearanceRadius(setup) {
+  return Math.max(0, effectiveFootprint(setup).radius + configuredClearanceRadius(setup));
 }
 
 function nav2FootprintString(setup) {
@@ -2678,12 +2683,12 @@ function obstacleCellsFor(obstacles, setup) {
   return keys;
 }
 
-function inflatedCellSet(setup, extraRadius = 0) {
+function inflatedCellSetForRadius(setup, radius) {
   const metrics = mapMetrics(setup);
   const blocked = blockedCellSet(setup);
   const inflated = new Set(blocked);
-  const radius = plannerClearanceRadius(setup) + Math.max(0, Number(extraRadius) || 0);
-  const radiusCells = Math.ceil(radius / metrics.cellSize);
+  const normalizedRadius = Math.max(0, Number(radius) || 0);
+  const radiusCells = Math.ceil(normalizedRadius / metrics.cellSize);
   for (const key of blocked) {
     const cell = parseCellKey(key);
     for (let dx = -radiusCells; dx <= radiusCells; dx += 1) {
@@ -2691,7 +2696,7 @@ function inflatedCellSet(setup, extraRadius = 0) {
         const x = cell.x + dx;
         const y = cell.y + dy;
         if (x < 0 || y < 0 || x >= metrics.cols || y >= metrics.rows) continue;
-        if (Math.hypot(dx, dy) * metrics.cellSize <= radius) {
+        if (Math.hypot(dx, dy) * metrics.cellSize <= normalizedRadius) {
           inflated.add(cellKey(x, y));
         }
       }
@@ -2700,8 +2705,28 @@ function inflatedCellSet(setup, extraRadius = 0) {
   return inflated;
 }
 
+function inflatedCellSet(setup, extraRadius = 0) {
+  return inflatedCellSetForRadius(
+    setup,
+    plannerClearanceRadius(setup) + Math.max(0, Number(extraRadius) || 0),
+  );
+}
+
 function softInflatedCellSet(setup) {
   return inflatedCellSet(setup, setup.fallbackNavigation?.softDistance ?? 0.10);
+}
+
+// Keep the overlay tied to the configured margins while collision planning also
+// accounts for the robot footprint internally.
+function displayedHardInflatedCellSet(setup) {
+  return inflatedCellSetForRadius(setup, configuredClearanceRadius(setup));
+}
+
+function displayedSoftInflatedCellSet(setup) {
+  return inflatedCellSetForRadius(
+    setup,
+    configuredClearanceRadius(setup) + (setup.fallbackNavigation?.softDistance ?? 0.10),
+  );
 }
 
 function planPathToGoal() {
@@ -2943,7 +2968,7 @@ function runAStar(start, goal, blocked, metrics, soft = new Set()) {
       ) {
         continue;
       }
-      const softMultiplier = soft.has(nextKey) ? 4 : 1;
+      const softMultiplier = soft.has(nextKey) ? ASTAR_SOFT_CELL_MULTIPLIER : 1;
       const tentativeG = current.g + next.cost * softMultiplier;
       if (tentativeG >= (gScore.get(nextKey) ?? Infinity)) continue;
       cameFrom.set(nextKey, current.key);
@@ -3914,8 +3939,8 @@ function drawPlanningOverlay(ctx, canvas, setup, mode) {
   const occupied = blockedCellSet(setup);
   const dynamicOccupied = dynamicLidarObstacleCellKeys(setup);
   const staticOccupied = new Set(Array.from(occupied).filter((key) => !dynamicOccupied.has(key)));
-  const hardInflated = inflatedCellSet(setup);
-  const softInflated = softInflatedCellSet(setup);
+  const hardInflated = displayedHardInflatedCellSet(setup);
+  const softInflated = displayedSoftInflatedCellSet(setup);
   const free = new Set(normalizeBlockedCells(setup.planner?.freeCells || []));
   if (setup.planner?.showInflation) {
     const hardOnly = new Set(Array.from(hardInflated).filter((key) => !occupied.has(key)));

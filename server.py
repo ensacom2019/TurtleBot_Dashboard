@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-16.78"
+APP_VERSION = "2026-07-16.79"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -59,6 +59,7 @@ FALLBACK_REPLAN_RECOVERY_SECONDS = 3.0
 FALLBACK_REPLAN_RECOVERY_ATTEMPTS = 5
 FALLBACK_DYNAMIC_REPLAN_LOOKAHEAD = 0.20
 FALLBACK_DYNAMIC_REPLAN_COOLDOWN = 1.5
+ASTAR_SOFT_CELL_MULTIPLIER = 12.0
 DYNAMIC_LIDAR_OBSTACLE_CELL_SIZE = 0.08
 DYNAMIC_LIDAR_OBSTACLE_MIN_POINTS = 5
 DYNAMIC_LIDAR_OBSTACLE_HOLD_SECONDS = 1.0
@@ -2186,7 +2187,7 @@ def fallback_astar_cells(
                 or (current[0], current[1] + delta_y) in blocked
             ):
                 continue
-            soft_multiplier = 4.0 if next_cell in soft else 1.0
+            soft_multiplier = ASTAR_SOFT_CELL_MULTIPLIER if next_cell in soft else 1.0
             next_score = score + math.hypot(delta_x, delta_y) * soft_multiplier
             if next_score >= scores.get(next_cell, math.inf):
                 continue
