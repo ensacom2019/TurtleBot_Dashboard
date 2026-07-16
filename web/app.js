@@ -238,7 +238,7 @@ function bindTabs() {
       document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.remove("active"));
       button.classList.add("active");
       document.getElementById(button.dataset.tab).classList.add("active");
-      if (button.dataset.tab !== "drive") stopManualDrive({ force: true });
+      if (button.dataset.tab !== "drive") stopManualDrive();
       if (button.dataset.tab === "drive") refreshRunLogSummary();
       resizeCanvases();
     });
@@ -729,7 +729,7 @@ function updateCameraUi(runtime = state.data?.runtime || {}) {
   els.cameraCompressedButton.classList.toggle("active", streamMode === "compressed");
   els.cameraRawButton.setAttribute("aria-pressed", String(streamMode === "raw"));
   els.cameraCompressedButton.setAttribute("aria-pressed", String(streamMode === "compressed"));
-  const fps = Number(runtime.cameraFps);
+  const fps = runtime.cameraFps;
   els.cameraFpsBadge.textContent = enabled && Number.isFinite(fps) ? `FPS ${fps.toFixed(1)}` : "FPS -";
   els.cameraFpsBadge.classList.toggle("off", !enabled);
   els.cameraFrame.classList.toggle("camera-off", !enabled);
@@ -1853,15 +1853,17 @@ async function stopManualDrive(options = {}) {
 
 function stopManualDriveFromFocusLoss() {
   state.pressedKeys.clear();
-  stopManualDrive({ force: true });
+  stopManualDrive();
 }
 
 function sendManualStopBeacon() {
+  const shouldSend = manualCommandActive();
   clearInterval(state.manualTimer);
   state.manualTimer = null;
   state.manualCommand = { linear: 0, angular: 0 };
   state.pressedKeys.clear();
   updateManualButtonState();
+  if (!shouldSend) return;
   const payload = JSON.stringify(state.manualCommand);
   if (navigator.sendBeacon) {
     navigator.sendBeacon("/api/manual_drive", new Blob([payload], { type: "application/json" }));
@@ -2117,6 +2119,7 @@ function readSetupForm() {
     accessory: setup.accessory,
     safety: setup.safety,
     object: setup.object,
+    fallbackNavigation: setup.fallbackNavigation,
     obstacles: setup.obstacles,
     planner: setup.planner,
     network: setup.network,
@@ -3166,6 +3169,7 @@ function syncSetupShadow() {
     accessory: setup.accessory,
     safety: setup.safety,
     object: setup.object,
+    fallbackNavigation: setup.fallbackNavigation,
     obstacles: setup.obstacles,
     planner: setup.planner,
     network: setup.network,

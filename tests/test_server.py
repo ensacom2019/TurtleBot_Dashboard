@@ -83,7 +83,11 @@ class ServerHelpersTest(unittest.TestCase):
         }
         state.camera_bytes = None
         state.camera_content_type = "image/svg+xml"
-        state._camera_frame_times = server.deque(maxlen=60)
+        state._camera_frame_times = server.deque(maxlen=180)
+        state._camera_frames = server.deque(maxlen=server.CAMERA_STREAM_BUFFER_FRAMES)
+        state._camera_fps_estimate = None
+        state._camera_fps_updated_at = 0.0
+        state._camera_metrics_logged_at = 0.0
 
         state.set_camera(b"jpeg-frame", "image/jpeg", "compressed")
         content, content_type, sequence, enabled, stream_mode = state.wait_for_camera_frame(
@@ -96,11 +100,130 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertEqual(stream_mode, "compressed")
 
+    def test_camera_buffer_delivers_burst_frames_in_order(self) -> None:
+        state = object.__new__(server.DashboardState)
+        state._lock = server.threading.RLock()
+        state._camera_condition = server.threading.Condition(state._lock)
+        state._camera_sequence = 0
+        state._state = {
+            "runtime": {
+                "cameraEnabled": True,
+                "cameraStream": "compressed",
+                "cameraFps": None,
+            }
+        }
+        state.camera_bytes = None
+        state.camera_content_type = "image/svg+xml"
+        state._camera_frame_times = server.deque(maxlen=180)
+        state._camera_frames = server.deque(maxlen=server.CAMERA_STREAM_BUFFER_FRAMES)
+        state._camera_fps_estimate = None
+        state._camera_fps_updated_at = 0.0
+        state._camera_metrics_logged_at = 0.0
+
+        for index in range(3):
+            state.set_camera(f"frame-{index}".encode(), "image/jpeg", "compressed")
+
+        first = state.wait_for_camera_frame(-1, timeout=0.0)
+        second = state.wait_for_camera_frame(1, timeout=0.0)
+        third = state.wait_for_camera_frame(2, timeout=0.0)
+
+        self.assertEqual((first[0], first[2]), (b"frame-2", 3))
+        self.assertEqual((second[0], second[2]), (b"frame-1", 2))
+        self.assertEqual((third[0], third[2]), (b"frame-2", 3))
+
     def test_camera_stream_endpoint_uses_multipart_latest_frame_delivery(self) -> None:
         source = inspect.getsource(server.DashboardHandler._camera_stream)
         self.assertIn("multipart/x-mixed-replace", source)
         self.assertIn("wait_for_camera_frame", source)
         self.assertIn("next_sequence == sequence", source)
+        self.assertIn("CAMERA_STREAM_MAX_FPS", source)
+        self.assertIn(
+            "time.sleep(delay)\n                last_sent_at = time.monotonic()\n                header",
+            source,
+        )
+
+    def test_camera_diagnostics_measure_only_one_image_transport(self) -> None:
+        commands = server.diagnostic_commands_for_topics(
+            {
+                "scan": "/scan",
+                "odom": "/odom",
+                "camera": "/camera/image_raw",
+                "compressedCamera": "/camera/image_raw/compressed",
+            }
+        )
+        camera_hz_commands = [
+            command
+            for command in commands
+            if command[1:3] == ["topic", "hz"] and "camera" in command[3]
+        ]
+        self.assertEqual(
+            camera_hz_commands,
+            [["ros2", "topic", "hz", "/camera/image_raw/compressed", "--window", "5"]],
+        )
+
+    def test_camera_diagnostic_rate_topic_does_not_depend_on_its_name(self) -> None:
+        topics = {
+            "camera": "/images/raw",
+            "compressedCamera": "/images/compressed",
+        }
+        self.assertEqual(server.diagnostic_camera_rate_topic(topics), "/images/compressed")
+        commands = server.diagnostic_commands_for_topics(topics)
+        self.assertIn(
+            ["ros2", "topic", "hz", "/images/compressed", "--window", "5"],
+            commands,
+        )
+
+    def test_setup_form_persists_fallback_navigation(self) -> None:
+        source = (server.WEB_ROOT / "app.js").read_text(encoding="utf-8")
+        read_setup = source[
+            source.index("function readSetupForm()") : source.index("function currentSetup()")
+        ]
+        setup_shadow = source[
+            source.index("function syncSetupShadow()") : source.index("function setSetupTool(")
+        ]
+        expected = "fallbackNavigation: setup.fallbackNavigation"
+        self.assertIn(expected, read_setup)
+        self.assertIn(expected, setup_shadow)
+
+    def test_inactive_page_hide_does_not_send_manual_stop(self) -> None:
+        source = (server.WEB_ROOT / "app.js").read_text(encoding="utf-8")
+        focus_loss = source[
+            source.index("function stopManualDriveFromFocusLoss()") : source.index(
+                "function sendManualStopBeacon()"
+            )
+        ]
+        beacon = source[
+            source.index("function sendManualStopBeacon()") : source.index(
+                "function setWaypointMode("
+            )
+        ]
+        self.assertIn("stopManualDrive();", focus_loss)
+        self.assertNotIn("force: true", focus_loss)
+        self.assertIn("const shouldSend = manualCommandActive();", beacon)
+        self.assertIn("if (!shouldSend) return;", beacon)
+
+    def test_null_bridge_zero_manual_command_reports_stop(self) -> None:
+        class FakeState:
+            def __init__(self) -> None:
+                self.runtime = {}
+
+            def get_setup(self):
+                return {"topics": {"cmdVel": "/cmd_vel"}}
+
+            def log_run_event(self, _event_type, **_data):
+                pass
+
+            def update_runtime(self, patch):
+                self.runtime.update(patch)
+
+        bridge = object.__new__(server.NullRosBridge)
+        bridge.state = FakeState()
+        bridge._last_logged_manual_command = None
+        bridge._cancel_route_repeat = lambda: None
+
+        bridge.manual_drive(0.0, 0.0)
+
+        self.assertEqual(bridge.state.runtime["navStatus"], "manual_stop")
 
     def test_camera_subscription_switch_keeps_only_selected_transport(self) -> None:
         created = []
@@ -471,6 +594,22 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertIn("rosBridgeError: ModuleNotFoundError: No module named 'rclpy'", report)
         self.assertIn('"rosBridgeError": "ModuleNotFoundError: No module named \'rclpy\'"', report)
+
+    def test_diagnostics_commands_use_configured_ros_domain(self) -> None:
+        report = server.format_diagnostics_report(
+            {
+                "setup": {
+                    "network": {"rosDomainId": "7", "rosLocalhostOnly": "0"},
+                    "topics": {},
+                    "robotProfiles": {},
+                    "fallbackNavigation": {},
+                },
+                "runtime": {},
+            },
+            {"ok": False, "checks": [], "advice": []},
+        )
+        command = "export ROS_DOMAIN_ID=7 && export ROS_LOCALHOST_ONLY=0 && ros2 topic list"
+        self.assertEqual(report.count(command), 2)
 
     def test_same_subnet_hosts_stays_within_private_24(self) -> None:
         subnet, hosts = server.same_subnet_hosts("192.168.20.3")

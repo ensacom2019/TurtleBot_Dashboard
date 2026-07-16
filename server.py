@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-16.80"
+APP_VERSION = "2026-07-16.83"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -75,6 +75,12 @@ TWIST_STAMPED_TYPE = "geometry_msgs/msg/TwistStamped"
 DEFAULT_TURTLEBOT_LENGTH = 0.18
 DEFAULT_TURTLEBOT_WIDTH = 0.14
 DEFAULT_TURTLEBOT_RADIUS = 0.114
+CAMERA_FPS_WINDOW_SECONDS = 5.0
+CAMERA_FPS_MIN_WINDOW_SECONDS = 1.0
+CAMERA_FPS_UPDATE_SECONDS = 0.5
+CAMERA_FPS_SMOOTHING = 0.25
+CAMERA_STREAM_MAX_FPS = 30.0
+CAMERA_STREAM_BUFFER_FRAMES = 8
 
 
 def normalized_camera_stream_mode(value: Any) -> str:
@@ -266,6 +272,8 @@ DEFAULT_STATE: Dict[str, Any] = {
         "cameraEnabled": True,
         "cameraStream": "compressed",
         "cameraFps": None,
+        "cameraBufferedFrames": 0,
+        "cameraFrameGapMs": None,
         "cameraSubscriptionTopic": None,
         "cameraSubscriptionQueueDepth": None,
         "cameraExecutorThreads": None,
@@ -1718,10 +1726,9 @@ def diagnostic_commands_for_topics(
             if topic:
                 commands.append(["ros2", "topic", "hz", topic, "--window", "5"])
         if include_camera_rate:
-            for key in ("camera", "compressedCamera"):
-                topic = str(topic_config.get(key) or "").strip()
-                if topic:
-                    commands.append(["ros2", "topic", "hz", topic, "--window", "5"])
+            topic = diagnostic_camera_rate_topic(topic_config)
+            if topic:
+                commands.append(["ros2", "topic", "hz", topic, "--window", "5"])
         action_name = str(topic_config.get("goalAction") or "").strip()
         if action_name:
             commands.append(["ros2", "action", "info", action_name])
@@ -1737,6 +1744,11 @@ def diagnostic_commands_for_topics(
         if isinstance(profile, dict):
             add_topic_commands(profile.get("topics", {}))
     return dedupe_commands(commands)
+
+
+def diagnostic_camera_rate_topic(topics: Optional[Dict[str, Any]] = None) -> str:
+    topic_config = topics or {}
+    return str(topic_config.get("compressedCamera") or topic_config.get("camera") or "").strip()
 
 
 def _text_output(value: Any) -> str:
@@ -1798,10 +1810,30 @@ def collect_diagnostic_commands(
     robot_profiles: Optional[Dict[str, Any]] = None,
 ) -> list[Dict[str, Any]]:
     commands = diagnostic_commands_for_topics(topics, robot_profiles)
-    max_workers = max(1, len(commands))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(run_diagnostic_command, args) for args in commands]
-        return [future.result() for future in futures]
+    results: list[Optional[Dict[str, Any]]] = [None] * len(commands)
+    camera_rate_topic = diagnostic_camera_rate_topic(topics)
+    camera_rate_indexes = [
+        index
+        for index, args in enumerate(commands)
+        if len(args) >= 4
+        and args[1:3] == ["topic", "hz"]
+        and bool(camera_rate_topic)
+        and args[3] == camera_rate_topic
+    ]
+    regular_indexes = [index for index in range(len(commands)) if index not in camera_rate_indexes]
+    if regular_indexes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(regular_indexes)) as executor:
+            futures = {
+                index: executor.submit(run_diagnostic_command, commands[index])
+                for index in regular_indexes
+            }
+            for index, future in futures.items():
+                results[index] = future.result()
+    # A camera rate probe creates another DDS image subscriber. Run only one and
+    # keep it separate from the parallel probes so diagnostics do not stall video.
+    for index in camera_rate_indexes:
+        results[index] = run_diagnostic_command(commands[index])
+    return [result for result in results if result is not None]
 
 
 def redact_secret(text: str, secret: str) -> str:
@@ -2781,26 +2813,15 @@ def build_robot_ssh_diagnostics_script(
         if topic and topic not in unique_topics:
             unique_topics.append(topic)
     topic_array = " ".join(shlex.quote(topic) for topic in unique_topics)
-    hz_topics = [
-        topic
-        for topic in unique_topics
-        if topic
-        in {
-            topics.get("scan"),
-            topics.get("odom"),
-            topics.get("camera"),
-            topics.get("compressedCamera"),
-            "/camera/camera/image_raw",
-            "/camera/camera/image_raw/compressed",
-            "/camera/color/image_raw",
-            "/camera/color/image_raw/compressed",
-            "/camera/image_raw",
-            "/camera/image_raw/compressed",
-            "/camera/camera/color/image_raw",
-            "/camera/camera/color/image_raw/compressed",
-            "/tb3_2/camera/image_raw/compressed",
-        }
-    ]
+    hz_topics = []
+    for topic in (
+        topics.get("scan"),
+        topics.get("odom"),
+        topics.get("compressedCamera") or topics.get("camera"),
+    ):
+        normalized = str(topic or "").strip()
+        if normalized and normalized not in hz_topics:
+            hz_topics.append(normalized)
     hz_topic_array = " ".join(shlex.quote(topic) for topic in hz_topics)
     action_name = str(topics.get("goalAction") or "/navigate_to_pose").strip() or "/navigate_to_pose"
     action_name_q = shlex.quote(action_name)
@@ -3505,6 +3526,10 @@ def format_diagnostics_report(
     pose_topic = topics.get("pose") or "/amcl_pose"
     action_name = topics.get("goalAction") or "/navigate_to_pose"
     route_action_name = topics.get("routeAction") or "/navigate_through_poses"
+    configured_domain = str(network.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or "1")
+    configured_localhost = str(
+        network.get("rosLocalhostOnly") or os.environ.get("ROS_LOCALHOST_ONLY") or "0"
+    )
     connection = check.get("connection") or runtime.get("connection") or {}
     checks = check.get("checks", [])
     advice = check.get("advice", [])
@@ -3553,6 +3578,8 @@ def format_diagnostics_report(
                 "cameraEnabled": runtime.get("cameraEnabled"),
                 "cameraStream": runtime.get("cameraStream"),
                 "cameraFps": runtime.get("cameraFps"),
+                "cameraBufferedFrames": runtime.get("cameraBufferedFrames"),
+                "cameraFrameGapMs": runtime.get("cameraFrameGapMs"),
                 "cameraSubscriptionTopic": runtime.get("cameraSubscriptionTopic"),
                 "cameraSubscriptionQueueDepth": runtime.get("cameraSubscriptionQueueDepth"),
                 "cameraExecutorThreads": runtime.get("cameraExecutorThreads"),
@@ -3650,7 +3677,7 @@ def format_diagnostics_report(
             "\n".join(actions or ["-"]),
             "",
             "## Manual Commands To Compare",
-            f"server: export ROS_DOMAIN_ID=1 && export ROS_LOCALHOST_ONLY=0 && ros2 topic list",
+            f"server: export ROS_DOMAIN_ID={configured_domain} && export ROS_LOCALHOST_ONLY={configured_localhost} && ros2 topic list",
             f"server: ros2 topic info {cmd_topic} -v",
             f"server: ros2 topic info {scan_topic} -v",
             f"server: ros2 topic info {odom_topic} -v",
@@ -3658,7 +3685,7 @@ def format_diagnostics_report(
             f"server: ros2 action info {action_name}",
             f"server: ros2 action info {route_action_name}",
             "server: ros2 topic info /tf -v",
-            "robot:  export ROS_DOMAIN_ID=1 && export ROS_LOCALHOST_ONLY=0 && ros2 topic list",
+            f"robot:  export ROS_DOMAIN_ID={configured_domain} && export ROS_LOCALHOST_ONLY={configured_localhost} && ros2 topic list",
             "",
         ]
     )
@@ -3784,6 +3811,13 @@ class RunLogStore:
                 "goal": runtime.get("goal"),
                 "routeCheckpoint": runtime.get("routeCheckpoint"),
                 "fallbackRecoveryPhase": runtime.get("fallbackRecoveryPhase"),
+                "cameraEnabled": runtime.get("cameraEnabled"),
+                "cameraStream": runtime.get("cameraStream"),
+                "cameraFps": runtime.get("cameraFps"),
+                "cameraBufferedFrames": runtime.get("cameraBufferedFrames"),
+                "cameraFrameGapMs": runtime.get("cameraFrameGapMs"),
+                "cameraSubscriptionTopic": runtime.get("cameraSubscriptionTopic"),
+                "lastCameraAt": runtime.get("lastCameraAt"),
                 "lastScanAt": runtime.get("lastScanAt"),
                 "lastOdomAt": runtime.get("lastOdomAt"),
             },
@@ -3828,7 +3862,13 @@ class DashboardState:
         )
         self.camera_bytes: Optional[bytes] = None
         self.camera_content_type = "image/svg+xml"
-        self._camera_frame_times: deque[float] = deque(maxlen=60)
+        self._camera_frame_times: deque[float] = deque(maxlen=180)
+        self._camera_frames: deque[Tuple[int, bytes, str]] = deque(
+            maxlen=CAMERA_STREAM_BUFFER_FRAMES
+        )
+        self._camera_fps_estimate: Optional[float] = None
+        self._camera_fps_updated_at = 0.0
+        self._camera_metrics_logged_at = 0.0
         self._camera_condition = threading.Condition(self._lock)
         self._camera_sequence = 0
         self.save()
@@ -3933,6 +3973,7 @@ class DashboardState:
             "setup_saved",
             robot=snapshot.get("setup", {}).get("robot"),
             planner=snapshot.get("setup", {}).get("planner"),
+            fallbackNavigation=snapshot.get("setup", {}).get("fallbackNavigation"),
             obstacleCount=len(snapshot.get("setup", {}).get("obstacles", []) or []),
             activeRobot=snapshot.get("setup", {}).get("activeRobot"),
         )
@@ -4160,7 +4201,12 @@ class DashboardState:
                 self.camera_bytes = None
                 self.camera_content_type = "image/svg+xml"
                 self._camera_frame_times.clear()
+                self._camera_frames.clear()
+                self._camera_fps_estimate = None
+                self._camera_fps_updated_at = 0.0
                 self._state["runtime"]["cameraFps"] = None
+                self._state["runtime"]["cameraBufferedFrames"] = 0
+                self._state["runtime"]["cameraFrameGapMs"] = None
             self._camera_sequence += 1
             self._camera_condition.notify_all()
             return json.loads(json.dumps(self._state["runtime"]))
@@ -4174,7 +4220,12 @@ class DashboardState:
             self.camera_content_type = "image/svg+xml"
             runtime["lastCameraAt"] = None
             runtime["cameraFps"] = None
+            runtime["cameraBufferedFrames"] = 0
+            runtime["cameraFrameGapMs"] = None
             self._camera_frame_times.clear()
+            self._camera_frames.clear()
+            self._camera_fps_estimate = None
+            self._camera_fps_updated_at = 0.0
             self._camera_sequence += 1
             self._camera_condition.notify_all()
             return json.loads(json.dumps(runtime))
@@ -4190,6 +4241,7 @@ class DashboardState:
             )
 
     def set_camera(self, content: bytes, content_type: str, stream_mode: str) -> None:
+        metrics: Optional[Dict[str, Any]] = None
         with self._lock:
             runtime = self._state.get("runtime", {})
             if (
@@ -4201,13 +4253,53 @@ class DashboardState:
             self.camera_bytes = content
             self.camera_content_type = content_type
             received = time.monotonic()
+            previous_received = self._camera_frame_times[-1] if self._camera_frame_times else None
             self._camera_frame_times.append(received)
-            while self._camera_frame_times and received - self._camera_frame_times[0] > 2.0:
+            while (
+                self._camera_frame_times
+                and received - self._camera_frame_times[0] > CAMERA_FPS_WINDOW_SECONDS
+            ):
                 self._camera_frame_times.popleft()
             runtime["lastCameraAt"] = now_iso()
-            runtime["cameraFps"] = camera_frame_rate(list(self._camera_frame_times))
             self._camera_sequence += 1
+            self._camera_frames.append((self._camera_sequence, content, content_type))
+            runtime["cameraBufferedFrames"] = len(self._camera_frames)
+            if previous_received is not None:
+                runtime["cameraFrameGapMs"] = round((received - previous_received) * 1000.0, 1)
+            sample_window = (
+                self._camera_frame_times[-1] - self._camera_frame_times[0]
+                if len(self._camera_frame_times) >= 2
+                else 0.0
+            )
+            if (
+                sample_window >= CAMERA_FPS_MIN_WINDOW_SECONDS
+                and received - self._camera_fps_updated_at >= CAMERA_FPS_UPDATE_SECONDS
+            ):
+                sample_rate = camera_frame_rate(list(self._camera_frame_times))
+                if sample_rate is not None:
+                    if self._camera_fps_estimate is None:
+                        self._camera_fps_estimate = sample_rate
+                    else:
+                        self._camera_fps_estimate += CAMERA_FPS_SMOOTHING * (
+                            sample_rate - self._camera_fps_estimate
+                        )
+                    runtime["cameraFps"] = round(self._camera_fps_estimate, 1)
+                    self._camera_fps_updated_at = received
+            if (
+                runtime.get("cameraFps") is not None
+                and received - self._camera_metrics_logged_at >= 10.0
+            ):
+                self._camera_metrics_logged_at = received
+                metrics = {
+                    "cameraFps": runtime.get("cameraFps"),
+                    "cameraBufferedFrames": runtime.get("cameraBufferedFrames"),
+                    "cameraFrameGapMs": runtime.get("cameraFrameGapMs"),
+                    "cameraStream": runtime.get("cameraStream"),
+                    "cameraSubscriptionTopic": runtime.get("cameraSubscriptionTopic"),
+                }
             self._camera_condition.notify_all()
+        if metrics is not None:
+            self.log_run_event("camera_metrics", **metrics)
 
     def get_camera(self) -> Tuple[bytes, str]:
         with self._lock:
@@ -4230,11 +4322,23 @@ class DashboardState:
             stream_mode = normalized_camera_stream_mode(runtime.get("cameraStream"))
             if not enabled:
                 content, content_type = camera_disabled_svg(), "image/svg+xml"
+                sequence = self._camera_sequence
+            elif self._camera_frames:
+                if last_sequence < 0:
+                    sequence, content, content_type = self._camera_frames[-1]
+                else:
+                    frame = next(
+                        (item for item in self._camera_frames if item[0] > last_sequence),
+                        self._camera_frames[-1],
+                    )
+                    sequence, content, content_type = frame
             elif self.camera_bytes:
                 content, content_type = self.camera_bytes, self.camera_content_type
+                sequence = self._camera_sequence
             else:
                 content, content_type = placeholder_svg(), "image/svg+xml"
-            return content, content_type, self._camera_sequence, enabled, stream_mode
+                sequence = self._camera_sequence
+            return content, content_type, sequence, enabled, stream_mode
 
 
 def placeholder_svg() -> bytes:
@@ -4606,6 +4710,7 @@ class NullRosBridge:
         self._cancel_route_repeat()
         linear = max(-0.22, min(0.22, finite_float(linear, "linear")))
         angular = max(-2.84, min(2.84, finite_float(angular, "angular")))
+        active_command = abs(linear) > 0 or abs(angular) > 0
         topic = self.state.get_setup().get("topics", {}).get("cmdVel", "/cmd_vel")
         command = (round(linear, 3), round(angular, 3))
         if command != self._last_logged_manual_command:
@@ -4622,8 +4727,8 @@ class NullRosBridge:
                 "goal": None,
                 "route": [],
                 "routeIndex": 0,
-                "navStatus": "manual",
-                "navMessage": f"Preview manual drive on {topic}: v={linear:.2f}, w={angular:.2f}",
+                "navStatus": "manual" if active_command else "manual_stop",
+                "navMessage": f"Preview manual {'drive' if active_command else 'stop'} on {topic}: v={linear:.2f}, w={angular:.2f}",
                 "lastManualCommandAt": now_iso(),
                 "lastCommandAt": now_iso(),
             }
@@ -4687,7 +4792,7 @@ class NullRosBridge:
             "summary": "ROS2 브릿지가 연결되지 않았습니다.",
             "checks": checks,
             "advice": [
-                "서버 PC에서 source /opt/ros/jazzy/setup.bash 후 ROS_DOMAIN_ID=1로 실행하세요.",
+                f"서버 PC에서 source /opt/ros/jazzy/setup.bash 후 ROS_DOMAIN_ID={network.get('rosDomainId') or '1'}로 실행하세요.",
                 f"ROS2 브릿지 예외 원문: {bridge_error}",
                 *dashboard_access_advice(detected_server_ip or network.get("serverIp", "")),
             ],
@@ -7932,7 +8037,9 @@ class RosBridge:
         failed = {check["id"] for check in checks if check["level"] == "fail"}
         warned = {check["id"] for check in checks if check["level"] == "warn"}
         if "domain" in failed:
-            advice.append("서버와 로봇 모두 export ROS_DOMAIN_ID=1 로 맞춘 뒤 실행하세요.")
+            advice.append(
+                f"서버와 로봇 모두 export ROS_DOMAIN_ID={expected_domain or '1'} 로 맞춘 뒤 실행하세요."
+            )
         if "localhost" in failed:
             advice.append("서버와 로봇 모두 export ROS_LOCALHOST_ONLY=0 으로 설정하세요.")
         if "server_ip" in failed:
@@ -8752,6 +8859,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             sequence = -1
+            last_sent_at = 0.0
+            frame_interval = 1.0 / CAMERA_STREAM_MAX_FPS
             while True:
                 content, content_type, next_sequence, enabled, stream_mode = (
                     self.context.state.wait_for_camera_frame(sequence, timeout=1.0)
@@ -8761,6 +8870,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 if next_sequence == sequence:
                     continue
                 sequence = next_sequence
+                delay = frame_interval - (time.monotonic() - last_sent_at)
+                if delay > 0:
+                    time.sleep(delay)
+                last_sent_at = time.monotonic()
                 header = (
                     f"--{boundary}\r\n"
                     f"Content-Type: {content_type}\r\n"

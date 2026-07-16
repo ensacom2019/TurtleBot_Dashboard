@@ -2,7 +2,7 @@
 
 TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지도 설정, A* 경로 계획, LiDAR 기반 비상 주행, 수동 운전, 카메라 확인, 로봇 SSH 브링업을 한 화면에서 다룹니다.
 
-현재 문서 기준 버전은 `2026-07-16.80`입니다.
+현재 문서 기준 버전은 `2026-07-16.83`입니다.
 
 ## 다중 로봇 (서로 다른 ROS Domain)
 
@@ -128,7 +128,7 @@ python server.py --host 127.0.0.1 --port 8080
 웹 브라우저 <- HTTP API <- server.py/rclpy <- /scan, /odom, 카메라
 ```
 
-ROS 2 Jazzy에서는 각 ROS `Context`에 연결한 `SingleThreadedExecutor`가 LiDAR, odometry, 카메라와 action callback을 처리합니다. 브릿지의 spin이 멈추면 직접 publisher를 호출하는 수동주행은 될 수 있지만 센서 화면과 A* 직접 추종은 함께 멈춥니다. 실제 로봇 연결 시 셋업 또는 진단 화면에서 `mode: ros2`, `rosConnected: true`인지 확인하세요. `offline-preview`는 Windows UI 프리뷰용 상태입니다.
+ROS 2 Jazzy에서는 전용 `Context`에 연결한 2스레드 executor가 LiDAR, odometry, 카메라와 action callback을 처리합니다. 카메라는 별도 callback group을 사용합니다. 브릿지의 spin이 멈추면 직접 publisher를 호출하는 수동주행은 될 수 있지만 센서 화면과 A* 직접 추종은 함께 멈춥니다. 실제 로봇 연결 시 셋업 또는 진단 화면에서 `mode: ros2`, `rosConnected: true`인지 확인하세요. `offline-preview`는 Windows UI 프리뷰용 상태입니다.
 
 ## 운행 방식
 
@@ -138,7 +138,7 @@ ROS 2 Jazzy에서는 각 ROS `Context`에 연결한 `SingleThreadedExecutor`가 
 4. LiDAR와 odometry가 최신 상태인지 확인하고 `/cmd_vel` publisher 충돌을 방지합니다.
 5. LiDAR 점이 본체 외곽 3cm 이내로 들어오면 빈 방향을 찾아 회피합니다. 감속 구간에서는 설정된 감속 속도로 일정하게 주행합니다.
 
-지도에 표시되는 핑크 금지 영역은 설정한 `본체 외곽 추가 금지 여유`와 `장애물 추가 여유`만 반영하여 기존 범위를 유지합니다. 실제 A* 충돌 계산은 화면 표시와 별도로 본체와 부속품의 외접 반경까지 포함하므로 경로선은 로봇 중심 기준으로 안전거리를 확보합니다. Inflation 색상 영역에는 높은 이동 비용을 적용하여, 통과 가능한 흰색 공간이 있으면 가까운 색상 영역을 가로지르는 경로보다 흰색 경로를 우선합니다.
+지도에 표시되는 핑크 금지 영역은 설정한 `본체 외곽 추가 금지 여유`와 `장애물 추가 여유`만 반영하여 기존 범위를 유지합니다. 실제 A* 충돌 계산은 화면 표시와 별도로 본체와 부속품의 외접 반경까지 포함하므로 경로선은 로봇 중심 기준으로 안전거리를 확보합니다. Inflation 색상 영역에는 높은 이동 비용을 적용하여, 통과 가능한 흰색 공간이 있으면 가까운 색상 영역을 가로지르는 경로보다 흰색 경로를 우선합니다. 셋업의 Inflation 폭은 `저장` 시 `fallbackNavigation.softDistance`로 보존됩니다.
 
 중간 경유지가 장애물 영역에 있거나 A* 경로가 완전히 막힌 경우에는 해당 경유지만 실행 목록에서 제외하고 다음 경유지로 경로를 다시 계산합니다. 최종 목표는 뒤에 대체할 지점이 없으므로 도달할 수 없으면 주행을 시작하지 않습니다. 주행 중 LiDAR 임시 장애물로 재탐색할 때도 같은 규칙을 적용하며, 건너뛴 번호는 경로 상태와 주행 로그에 남깁니다.
 
@@ -157,6 +157,8 @@ ROS 2 Jazzy에서는 각 ROS `Context`에 연결한 `SingleThreadedExecutor`가 
 화면에는 `마지막 통과 #N · 다음 #N` 형식으로 복구 위치가 표시됩니다. 주행 로그에는 `route_checkpoint_started`, `route_checkpoint_updated`, `route_checkpoint_interrupted`, `route_checkpoint_resumed` 이벤트가 기록되므로 중단 및 재개 과정을 진단 자료와 함께 확인할 수 있습니다. 다른 로봇의 체크포인트는 선택한 로봇을 바꾸기 전에는 실행할 수 없습니다.
 
 실제 주행 전에는 낮은 속도와 넓은 안전 여유로 테스트하고, `/scan`, `/odom`, TF, `/cmd_vel` 수신 상태를 로봇 체크에서 확인하세요.
+
+수동 운전 중 브라우저가 포커스를 잃거나 페이지를 닫으면 마지막 수동 속도를 반드시 0으로 정지합니다. 수동 명령이 활성화되지 않은 상태에서는 페이지 새로고침이나 탭 전환만으로 `/cmd_vel` 정지 명령을 보내지 않으므로 진행 중인 자율주행을 취소하지 않습니다.
 
 ## 문제 해결
 
@@ -179,9 +181,9 @@ ROS spin stopped: spin() got an unexpected keyword argument 'context'
 
 주행 탭의 Raw/Compressed 선택과 셋업 토픽이 실제 ROS graph와 일치해야 합니다. 기본값은 `/camera/image_raw`와 `/camera/image_raw/compressed`입니다. 카메라 보정 YAML 누락 경고는 거리 보정 정보가 없다는 뜻이며 영상 publisher가 정상이라면 프레임 수신 자체를 막지는 않습니다.
 
-Raw 모드는 Python BMP 변환과 네트워크 부하를 제한하기 위해 최대 약 5 FPS로 샘플링합니다. Compressed 모드는 반복 HTTP 폴링 대신 최신 JPEG를 즉시 전달하는 MJPEG 스트림을 사용합니다. `2026-07-16.80`부터 선택한 Raw 또는 Compressed 토픽 하나만 구독하고, 1프레임 QoS 큐와 전용 callback group으로 LiDAR 처리 중에도 최신 영상을 우선합니다. 표시 FPS의 상한은 카메라 publisher의 실제 발행 속도이며, 네트워크와 브라우저 디코딩 성능이 충분하면 RQT에서 측정한 Compressed 토픽 속도에 가깝게 표시됩니다.
+Raw 모드는 Python BMP 변환과 네트워크 부하를 제한하기 위해 최대 약 5 FPS로 샘플링합니다. Compressed 모드는 반복 HTTP 폴링 대신 MJPEG 스트림을 사용합니다. 선택한 Raw 또는 Compressed 토픽 하나만 구독하고, 1프레임 ROS QoS 큐와 전용 callback group으로 LiDAR 처리 중에도 최신 영상을 우선합니다. `2026-07-16.83`부터 짧게 몰려오는 JPEG를 최대 8프레임만 임시 보관한 뒤 최대 30 FPS 간격으로 전달합니다. JPEG 쓰기 시간도 30 FPS 간격에 포함하므로 불필요하게 출력 속도가 낮아지지 않습니다. 버퍼를 넘긴 오래된 프레임은 건너뛰므로 영상 지연이 계속 누적되지 않습니다. 화면 FPS는 5초 수신 창을 0.5초마다 완만하게 갱신해 DDS의 순간적인 묶음 전달 때문에 20~40 FPS로 요동하는 현상을 줄입니다. 첫 프레임을 받기 전이나 카메라가 꺼진 상태는 `FPS -`로 표시합니다.
 
-진단 보고서의 `cameraSubscriptionTopic`, `cameraSubscriptionQueueDepth`, `cameraExecutorThreads`, `cameraFps`로 실제 구독 토픽과 대시보드 수신 속도를 확인할 수 있습니다. Compressed 모드에서는 큐 깊이 `1`, executor 스레드 `2`, 설정한 Compressed 토픽이 표시되어야 합니다.
+진단 보고서와 주행 로그의 `cameraSubscriptionTopic`, `cameraSubscriptionQueueDepth`, `cameraExecutorThreads`, `cameraFps`, `cameraBufferedFrames`, `cameraFrameGapMs`로 실제 구독 토픽, 수신 속도와 프레임 간격을 확인할 수 있습니다. Compressed 모드에서는 큐 깊이 `1`, executor 스레드 `2`, 설정한 Compressed 토픽이 표시되어야 합니다. 진단 중에는 Raw와 Compressed 속도를 동시에 측정하지 않고 선택된 Compressed 토픽 하나만 별도로 측정하므로 진단 자체가 영상 대역폭을 잠식하지 않습니다. 토픽명에 `camera` 문자열이 없어도 설정된 Compressed 토픽을 카메라 측정으로 분류합니다. 보고서의 비교 명령은 선택 로봇에 저장된 `ROS_DOMAIN_ID`와 `ROS_LOCALHOST_ONLY`를 사용합니다.
 
 ### Nav2 action server가 없을 때
 
