@@ -1,4 +1,6 @@
 import math
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,7 +43,7 @@ class ServerHelpersTest(unittest.TestCase):
         profiles = server.DEFAULT_STATE["setup"]["robotProfiles"]
         self.assertEqual(list(profiles), ["tb3_2"])
 
-    def test_legacy_turtlebot_1_profile_is_removed_but_discovered_profile_remains(self) -> None:
+    def test_direct_and_discovered_robot_profiles_are_retained(self) -> None:
         legacy_state = server.deep_merge(
             server.DEFAULT_STATE,
             {
@@ -52,8 +54,8 @@ class ServerHelpersTest(unittest.TestCase):
             },
         )
         normalized_legacy = server.normalize_robot_profiles_state(legacy_state)
-        self.assertEqual(list(normalized_legacy["setup"]["robotProfiles"]), ["tb3_2"])
-        self.assertEqual(normalized_legacy["setup"]["activeRobot"], "tb3_2")
+        self.assertIn("tb3_1", normalized_legacy["setup"]["robotProfiles"])
+        self.assertEqual(normalized_legacy["setup"]["activeRobot"], "tb3_1")
 
         discovered_state = server.deep_merge(
             server.DEFAULT_STATE,
@@ -131,13 +133,39 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("systemctl --user start", script)
         self.assertIn("KillMode=control-group", script)
         self.assertIn("KillSignal=SIGINT", script)
+        self.assertIn("shutdown_nav2_lifecycle_manager", script)
+        self.assertIn("stop_dashboard_tmux_session", script)
+        self.assertIn("Previous dashboard process for $name is still running", script)
+        self.assertIn("nohup setsid bash", script)
+        self.assertIn("Nav2 process remained after graceful dashboard shutdown", script)
         self.assertIn("loginctl show-user", script)
         self.assertIn("ensure_user_linger", script)
         self.assertIn('sudo -n loginctl enable-linger "$USER"', script)
         self.assertIn("sudo -S -p '' loginctl enable-linger", script)
         self.assertIn("unset SUDO_PASSWORD_B64", script)
+        self.assertIn('XDG_RUNTIME_DIR="/run/user/$USER_UID"', script)
+        self.assertIn('DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"', script)
+        self.assertIn("[DETAIL]", script)
         self.assertNotIn("bringup-test-password", script)
         self.assertNotIn("start_detached tb3_base", script)
+        self.assertNotIn('pkill -f "[m]ap_server', script)
+        self.assertNotIn("pkill -f", script)
+        if shutil.which("bash"):
+            syntax_check = subprocess.run(
+                ["bash", "-n"],
+                input=script.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                syntax_check.returncode,
+                0,
+                syntax_check.stderr.decode("utf-8", errors="replace"),
+            )
+        self.assertIn(
+            "ros2 launch turtlebot3_bringup camera.launch.py format:=RGB888", script
+        )
+        self.assertNotIn("ros2 run camera_ros camera_node", script)
 
     def test_robot_bringup_script_handles_missing_sudo_password(self) -> None:
         script = server.build_robot_bringup_script(
@@ -153,13 +181,57 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertIn('BASE_SERVICE="turtlebot-dashboard-base.service"', script)
         self.assertIn('systemctl --user stop "$BASE_SERVICE"', script)
-        self.assertIn("tmux send-keys -t tb3_base C-c", script)
+        self.assertIn('tmux send-keys -t "$session" C-c', script)
+        self.assertIn("stop_dashboard_tmux_session tb3_base", script)
+        self.assertIn("stop_dashboard_tmux_session tb3_nav2", script)
+        self.assertIn("stop_dashboard_tmux_session tb3_camera", script)
+        self.assertIn("stop_dashboard_nohup_process tb3_nav2", script)
+        self.assertIn("stop_dashboard_nohup_process tb3_camera", script)
+        self.assertIn("nav2_msgs/srv/ManageLifecycleNodes", script)
+        self.assertIn('NAVIGATION_MANAGER=/lifecycle_manager_navigation', script)
+        self.assertIn("{command: 4}", script)
         self.assertIn("/tb3_2/cmd_vel", script)
         self.assertIn("/tb3_2/scan", script)
         self.assertIn("dashboard bringup stop verification", script)
         self.assertIn("systemd service stopped", script)
+        self.assertIn('XDG_RUNTIME_DIR="/run/user/$USER_UID"', script)
+        self.assertIn('DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"', script)
         self.assertNotIn('pkill -f "[r]os2 launch turtlebot3_bringup', script)
+        self.assertNotIn('pkill -f "[m]ap_server', script)
+        self.assertNotIn('pkill -f "[c]amera_ros', script)
+        self.assertIn("Nav2 processes still active (not force-killed)", script)
+        self.assertIn("Camera processes still active (not force-killed)", script)
         self.assertIn("exit 22", script)
+        if shutil.which("bash"):
+            syntax_check = subprocess.run(
+                ["bash", "-n"],
+                input=script.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                syntax_check.returncode,
+                0,
+                syntax_check.stderr.decode("utf-8", errors="replace"),
+            )
+
+    def test_default_robot_ssh_password_is_1234(self) -> None:
+        self.assertEqual(server.DEFAULT_STATE["setup"]["network"]["robotSshPassword"], "1234")
+
+    def test_robot_ssh_operations_reject_overlapping_requests_for_same_robot(self) -> None:
+        state = SimpleNamespace(get_setup=lambda: server.DEFAULT_STATE["setup"])
+        lock = server.robot_operation_lock("tb3_2")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            bringup = server.run_robot_bringup_from_state(state)
+            stop = server.run_robot_bringup_stop_from_state(state)
+        finally:
+            lock.release()
+
+        self.assertFalse(bringup["ok"])
+        self.assertFalse(stop["ok"])
+        self.assertIn("already in progress", bringup["error"])
+        self.assertIn("already in progress", stop["error"])
 
     def test_server_ip_prefers_robot_subnet(self) -> None:
         selected = server.select_server_ip(
@@ -189,9 +261,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(server.same_subnet_hosts("not-an-ip"), (None, []))
 
     def test_root_namespace_topics_have_one_leading_slash(self) -> None:
-        topics = server.topics_for_namespace("/", "camera_ros")
+        topics = server.topics_for_namespace("/", "plain")
         self.assertEqual(topics["cmdVel"], "/cmd_vel")
-        self.assertEqual(topics["camera"], "/camera/camera/image_raw")
+        self.assertEqual(topics["camera"], "/camera/image_raw")
         self.assertEqual(topics["routeAction"], "/navigate_through_poses")
 
     def test_topic_edits_are_persisted_to_the_active_robot_profile(self) -> None:
@@ -736,6 +808,8 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertIn("ros2 action info /navigate_to_pose", script)
         self.assertIn("ros2 action info /navigate_through_poses", script)
+        self.assertIn('XDG_RUNTIME_DIR="/run/user/$USER_UID"', script)
+        self.assertIn('DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"', script)
 
     def test_route_uses_navigate_through_poses_when_single_goal_action_is_missing(self) -> None:
         class FakeState:

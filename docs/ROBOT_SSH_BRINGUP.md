@@ -1,5 +1,9 @@
 # Robot SSH Bringup
 
+## Multiple robot profiles
+
+Register each robot manually in the dashboard. A profile owns its Robot IP, SSH Host/User/Password, ROS_DOMAIN_ID, and topics. Use a distinct ROS Domain for every robot. Bringup and stop always affect only the currently selected profile; operations on a different robot are independent.
+
 ## 목적
 
 대시보드의 `로봇 브링업` 버튼은 서버 PC에서 로봇으로 SSH 접속한 뒤, 로봇 쪽에서 필요한 ROS 노드를 실행하도록 돕는다.
@@ -120,8 +124,8 @@ ros2 launch turtlebot3_navigation2 navigation2.launch.py use_sim_time:=False map
 
 publisher가 없으면 설치된 패키지에 따라 시도한다.
 
-- `realsense2_camera`가 있으면 `rs_launch.py`
-- `camera_ros`가 있으면 `camera_node`
+- `turtlebot3_bringup`와 `camera_ros`가 있으면 공식 `camera.launch.py format:=RGB888`
+- 위 패키지가 없고 `realsense2_camera`가 있으면 `rs_launch.py`
 
 패키지가 없으면 카메라 bringup은 건너뛴다.
 

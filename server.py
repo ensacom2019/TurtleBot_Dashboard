@@ -36,7 +36,9 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.69"
+APP_VERSION = "2026-07-15.70"
+ROBOT_SSH_OPERATION_LOCK = threading.RLock()
+ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
 FALLBACK_SENSOR_PENDING_WAIT = 15.0
 FALLBACK_RECOVERY_STOP_SECONDS = 0.25
@@ -123,7 +125,15 @@ DEFAULT_ROBOT_PROFILES = {
         "namespace": "/",
         "body": {"length": DEFAULT_TURTLEBOT_LENGTH, "width": DEFAULT_TURTLEBOT_WIDTH},
         "mapPose": {"enabled": False, "x": None, "y": None, "yaw": 0.0},
-        "topics": topics_for_namespace("/", "camera_ros"),
+        "connection": {
+            "robotIp": "192.168.20.7",
+            "rosDomainId": os.environ.get("ROS_DOMAIN_ID", "1"),
+            "rosLocalhostOnly": os.environ.get("ROS_LOCALHOST_ONLY", "0"),
+            "robotSshHost": "192.168.20.7",
+            "robotSshUser": "kim",
+            "robotSshPassword": "1234",
+        },
+        "topics": topics_for_namespace("/", "plain"),
     },
 }
 
@@ -234,6 +244,7 @@ DEFAULT_STATE: Dict[str, Any] = {
         "routeRepeatStart": 1,
         "routeRepeatEnd": 1,
         "routeRepeatResumeAt": None,
+        "robotPoses": {},
         "navStatus": "idle",
         "navMessage": "",
         "cameraEnabled": True,
@@ -322,6 +333,39 @@ def normalized_robot_map_pose(map_pose: Any) -> Dict[str, Any]:
     return values
 
 
+ROBOT_CONNECTION_KEYS = (
+    "robotIp",
+    "rosDomainId",
+    "rosLocalhostOnly",
+    "robotSshHost",
+    "robotSshUser",
+    "robotSshPassword",
+)
+
+
+def normalized_robot_connection(connection: Any, fallback: Any = None) -> Dict[str, str]:
+    """Normalize one robot's private ROS/SSH connection settings.
+
+    `serverIp` deliberately stays global: it describes this dashboard host, while
+    every other field describes the selected robot.
+    """
+    raw = connection if isinstance(connection, dict) else {}
+    defaults = fallback if isinstance(fallback, dict) else {}
+    result = {
+        key: str(raw.get(key, defaults.get(key, "")) or "").strip()
+        for key in ROBOT_CONNECTION_KEYS
+    }
+    try:
+        domain = int(result["rosDomainId"])
+    except (TypeError, ValueError):
+        domain = 1
+    result["rosDomainId"] = str(max(0, min(domain, 232)))
+    result["rosLocalhostOnly"] = "1" if result["rosLocalhostOnly"] == "1" else "0"
+    if not result["robotSshHost"]:
+        result["robotSshHost"] = result["robotIp"]
+    return result
+
+
 def fresh_runtime_state(setup: Dict[str, Any], previous_runtime: Any = None) -> Dict[str, Any]:
     """Discard stale sensor/navigation data while retaining local camera preferences."""
     previous = previous_runtime if isinstance(previous_runtime, dict) else {}
@@ -349,21 +393,26 @@ def fresh_runtime_state(setup: Dict[str, Any], previous_runtime: Any = None) -> 
 
 
 def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only TurtleBot 2 initially; retain profiles added by robot discovery."""
+    """Normalize directly registered robot profiles and migrate legacy settings."""
     setup = state.setdefault("setup", {})
     profiles = setup.get("robotProfiles")
     if not isinstance(profiles, dict):
         profiles = {}
-    legacy_tb3_1 = profiles.get("tb3_1")
-    if isinstance(legacy_tb3_1, dict) and legacy_tb3_1.get("source") != "discovered":
-        profiles.pop("tb3_1", None)
     if "tb3_2" not in profiles:
         profiles["tb3_2"] = json.loads(json.dumps(DEFAULT_ROBOT_PROFILES["tb3_2"]))
-    for profile in profiles.values():
+    legacy_network = setup.get("network") if isinstance(setup.get("network"), dict) else {}
+    for profile_id, profile in profiles.items():
         if not isinstance(profile, dict):
             continue
         profile["body"] = normalized_robot_body(profile.get("body"))
         profile["mapPose"] = normalized_robot_map_pose(profile.get("mapPose"))
+        # Existing saved installations had a single setup.network.  Its settings
+        # become TurtleBot 2's connection on first load without dropping a saved
+        # SSH password.
+        fallback_connection = legacy_network if profile_id == "tb3_2" else {}
+        profile["connection"] = normalized_robot_connection(
+            profile.get("connection"), fallback_connection
+        )
     setup["robotProfiles"] = profiles
     robot = setup.get("robot") if isinstance(setup.get("robot"), dict) else {}
     try:
@@ -398,6 +447,11 @@ def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
     # setup.topics remains an in-memory compatibility view. Robot profile topics
     # are the persisted source of truth for the selected robot.
     setup["topics"] = dict(active_profile["topics"])
+    active_connection = active_profile.get("connection", {})
+    setup_network = setup.get("network") if isinstance(setup.get("network"), dict) else {}
+    for key in ROBOT_CONNECTION_KEYS:
+        setup_network[key] = active_connection.get(key, "")
+    setup["network"] = setup_network
     return state
 
 
@@ -406,8 +460,6 @@ def synchronize_active_robot_topics(
 ) -> None:
     """Persist edited topic fields with the active robot profile as well as setup.topics."""
     topics = setup_patch.get("topics")
-    if not isinstance(topics, dict):
-        return
     active_robot = str(
         setup_patch.get("activeRobot") or existing_setup.get("activeRobot") or "tb3_2"
     )
@@ -425,8 +477,14 @@ def synchronize_active_robot_topics(
     profile = profiles.get(active_robot)
     if not isinstance(profile, dict):
         profile = {}
-    profile_topics = profile.get("topics") if isinstance(profile.get("topics"), dict) else {}
-    profile["topics"] = deep_merge(profile_topics, topics)
+    if isinstance(topics, dict):
+        profile_topics = profile.get("topics") if isinstance(profile.get("topics"), dict) else {}
+        profile["topics"] = deep_merge(profile_topics, topics)
+    network = setup_patch.get("network")
+    if isinstance(network, dict):
+        current_connection = profile.get("connection") if isinstance(profile.get("connection"), dict) else {}
+        incoming_connection = {key: network[key] for key in ROBOT_CONNECTION_KEYS if key in network}
+        profile["connection"] = deep_merge(current_connection, incoming_connection)
     profiles[active_robot] = profile
     setup_patch["robotProfiles"] = profiles
 
@@ -556,7 +614,9 @@ def effective_footprint_from_setup(setup: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
-def robot_avoidance_obstacles(setup: Dict[str, Any]) -> list[Dict[str, Any]]:
+def robot_avoidance_obstacles(
+    setup: Dict[str, Any], robot_poses: Optional[Dict[str, Any]] = None
+) -> list[Dict[str, Any]]:
     profiles = setup.get("robotProfiles", {}) or {}
     active_robot = str(setup.get("activeRobot") or "")
     if not isinstance(profiles, dict):
@@ -565,7 +625,11 @@ def robot_avoidance_obstacles(setup: Dict[str, Any]) -> list[Dict[str, Any]]:
     for profile_id, profile in profiles.items():
         if profile_id == active_robot or not isinstance(profile, dict):
             continue
-        pose = normalized_robot_map_pose(profile.get("mapPose"))
+        live_pose = (robot_poses or {}).get(profile_id)
+        if isinstance(live_pose, dict) and live_pose.get("available"):
+            pose = normalized_robot_map_pose({"enabled": True, **live_pose})
+        else:
+            pose = normalized_robot_map_pose(profile.get("mapPose"))
         if not pose["enabled"]:
             continue
         body = normalized_robot_body(profile.get("body"))
@@ -1407,6 +1471,40 @@ def public_network(network: Dict[str, Any]) -> Dict[str, Any]:
     return public
 
 
+def public_robot_profiles(profiles: Any) -> Dict[str, Any]:
+    public = json.loads(json.dumps(profiles if isinstance(profiles, dict) else {}))
+    for profile in public.values():
+        if isinstance(profile, dict):
+            profile["connection"] = public_network(profile.get("connection", {}))
+    return public
+
+
+def active_robot_profile(setup: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    profiles = setup.get("robotProfiles") if isinstance(setup.get("robotProfiles"), dict) else {}
+    robot_id = str(setup.get("activeRobot") or "tb3_2")
+    profile = profiles.get(robot_id)
+    if not isinstance(profile, dict):
+        robot_id = "tb3_2"
+        profile = profiles.get(robot_id) if isinstance(profiles.get(robot_id), dict) else {}
+    return robot_id, profile
+
+
+def active_robot_network(setup: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the selected profile's private settings plus dashboard server IP."""
+    network = dict(setup.get("network") or {})
+    _robot_id, profile = active_robot_profile(setup)
+    connection = profile.get("connection") if isinstance(profile.get("connection"), dict) else {}
+    for key in ROBOT_CONNECTION_KEYS:
+        if key in connection:
+            network[key] = connection[key]
+    return network
+
+
+def robot_operation_lock(robot_id: str) -> threading.Lock:
+    with ROBOT_SSH_OPERATION_LOCK:
+        return ROBOT_SSH_OPERATION_LOCKS.setdefault(robot_id, threading.Lock())
+
+
 BASE_DIAGNOSTIC_COMMANDS = [
     ["ros2", "topic", "list"],
     ["ros2", "topic", "info", "/tf", "-v"],
@@ -1971,6 +2069,7 @@ def fallback_replan_path(
     route: list[Dict[str, Any]],
     route_index: int,
     dynamic_obstacles: list[Dict[str, Any]],
+    robot_poses: Optional[Dict[str, Any]] = None,
 ) -> Tuple[list[Dict[str, Any]], str]:
     map_config = setup.get("map", {}) or {}
     source = configured_map_path(map_config)
@@ -2000,7 +2099,7 @@ def fallback_replan_path(
             grid_x = math.floor((pixel_x * float(metrics["resolution"])) / float(metrics["cellSize"]))
             if 0 <= grid_x < int(metrics["cols"]):
                 blocked.add((grid_x, grid_y))
-    for obstacle in [*robot_avoidance_obstacles(setup), *dynamic_obstacles]:
+    for obstacle in [*robot_avoidance_obstacles(setup, robot_poses), *dynamic_obstacles]:
         try:
             center_x = float(obstacle["x"])
             center_y = float(obstacle["y"])
@@ -2085,6 +2184,9 @@ export TURTLEBOT3_MODEL="${{TURTLEBOT3_MODEL:-burger}}"
 export LDS_MODEL="${{LDS_MODEL:-LDS-03}}"
 LOG_DIR="$HOME/turtlebot_dashboard_logs"
 mkdir -p "$LOG_DIR"
+USER_UID="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$USER_UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 
 source_ros() {{
   source /opt/ros/jazzy/setup.bash || return 10
@@ -2109,12 +2211,46 @@ pkg_exists() {{
   timeout -k 2 4 ros2 pkg prefix "$1" >/dev/null 2>&1
 }}
 
+shutdown_nav2_lifecycle_manager() {{
+  local manager="$1"
+  local response
+  response="$(timeout -k 1 8 ros2 service call "$manager/manage_nodes" nav2_msgs/srv/ManageLifecycleNodes "{{command: 4}}" 2>&1)"
+  if printf '%s\n' "$response" | grep -Eiq 'success[=:] *true'; then
+    echo "[STOP] Nav2 lifecycle shutdown: $manager"
+    return 0
+  fi
+  echo "[INFO] Nav2 lifecycle manager unavailable or already stopped: $manager"
+  return 1
+}}
+
+stop_dashboard_tmux_session() {{
+  local session="$1"
+  local attempt
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    return 0
+  fi
+  tmux send-keys -t "$session" C-c >/dev/null 2>&1 || true
+  echo "[STOP] Ctrl+C sent to dashboard tmux $session"
+  for attempt in $(seq 1 12); do
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+      echo "[OK] tmux session exited after Ctrl+C: $session"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[WARN] tmux session did not exit after Ctrl+C: $session"
+  tmux kill-session -t "$session" >/dev/null 2>&1 || true
+  echo "[FALLBACK] tmux session force-closed: $session"
+  return 1
+}}
+
 start_detached() {{
   local name="$1"
   shift
   local script="$LOG_DIR/${{name}}.sh"
   local log="$LOG_DIR/${{name}}.log"
   local runner="$LOG_DIR/${{name}}_runner.sh"
+  local pid_file="$LOG_DIR/${{name}}.pid"
   {{
     echo '#!/usr/bin/env bash'
     echo 'set +e'
@@ -2141,13 +2277,29 @@ start_detached() {{
   }} > "$runner"
   chmod +x "$runner"
   if command -v tmux >/dev/null 2>&1; then
-    tmux kill-session -t "$name" >/dev/null 2>&1 || true
+    if tmux has-session -t "$name" 2>/dev/null; then
+      if [ "$name" = "tb3_nav2" ]; then
+        shutdown_nav2_lifecycle_manager /lifecycle_manager_navigation || true
+        shutdown_nav2_lifecycle_manager /lifecycle_manager_localization || true
+      fi
+      stop_dashboard_tmux_session "$name" || true
+    fi
     tmux new-session -d -s "$name" "bash $runner"
     echo "[START] $name via tmux"
   else
-    pkill -f "$script" >/dev/null 2>&1 || true
-    nohup bash "$script" > "$log" 2>&1 </dev/null &
-    echo "[START] $name via nohup"
+    if [ -s "$pid_file" ]; then
+      local previous_pid
+      previous_pid="$(cat "$pid_file" 2>/dev/null || true)"
+      if [[ "$previous_pid" =~ ^[0-9]+$ ]] && kill -0 "$previous_pid" 2>/dev/null; then
+        echo "[FAIL] Previous dashboard process for $name is still running (pid $previous_pid)."
+        echo "[FIX] Use Bringup Stop first; it sends SIGINT before any fallback signal."
+        return 16
+      fi
+      rm -f "$pid_file"
+    fi
+    nohup setsid bash "$script" > "$log" 2>&1 </dev/null &
+    echo "$!" > "$pid_file"
+    echo "[START] $name via nohup (process group $!)"
   fi
   echo "[LOG] $log"
 }}
@@ -2198,8 +2350,10 @@ start_base_service() {{
   local base_script="$LOG_DIR/tb3_base.sh"
   local base_log="$LOG_DIR/tb3_base.log"
   ensure_user_linger || return 14
-  if ! systemctl --user show-environment >/dev/null 2>&1; then
+  local manager_output
+  if ! manager_output="$(systemctl --user show-environment 2>&1)"; then
     echo "[FAIL] systemd user manager is unavailable for $USER."
+    echo "[DETAIL] ${{manager_output:-user bus did not respond at $DBUS_SESSION_BUS_ADDRESS}}"
     echo "[FIX] Log in as this robot user and make systemctl --user available before dashboard bringup."
     return 13
   fi
@@ -2331,10 +2485,17 @@ echo
 echo "== nav2/amcl bringup =="
 if [ -n "${{DASHBOARD_NAV_MAP:-}}" ]; then
   echo "[INFO] dashboard map is configured; restarting Nav2 tmux session with $DASHBOARD_NAV_MAP"
-  tmux kill-session -t tb3_nav2 >/dev/null 2>&1 || true
-  pkill -f "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[b]ehavior_server|[c]ollision_monitor|[l]ifecycle_manager_navigation|[t]urtlebot3_navigation2|[n]av2_bringup" >/dev/null 2>&1 || true
+  shutdown_nav2_lifecycle_manager /lifecycle_manager_navigation || true
+  shutdown_nav2_lifecycle_manager /lifecycle_manager_localization || true
+  stop_dashboard_tmux_session tb3_nav2 || true
+  if process_running "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[b]ehavior_server|[c]ollision_monitor|[l]ifecycle_manager_(navigation|localization)|[t]urtlebot3_navigation2|[n]av2_bringup"; then
+    echo "[FAIL] Nav2 process remained after graceful dashboard shutdown; refusing to start a duplicate stack."
+    BRINGUP_FAIL=22
+  fi
 fi
-if process_running "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[t]urtlebot3_navigation2|[n]av2_bringup" && [ -z "${{DASHBOARD_NAV_MAP:-}}" ]; then
+if [ "$BRINGUP_FAIL" -ne 0 ]; then
+  echo "[SKIP] Nav2 start because a previous dashboard-managed Nav2 stack did not stop cleanly."
+elif process_running "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[t]urtlebot3_navigation2|[n]av2_bringup" && [ -z "${{DASHBOARD_NAV_MAP:-}}" ]; then
   echo "[OK] Nav2 appears to be already running"
 else
   NAV_MAP="${{DASHBOARD_NAV_MAP:-}}"
@@ -2365,14 +2526,14 @@ echo
 echo "== camera bringup =="
 if process_running "[c]amera_ros|[c]amera_node|[c]amera.launch.py|[r]ealsense|[u]sb_cam|[v]4l2"; then
   echo "[OK] camera process already running"
+elif pkg_exists turtlebot3_bringup && pkg_exists camera_ros; then
+  start_detached tb3_camera "export LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:${{LD_LIBRARY_PATH:-}}; export LIBCAMERA_IPA_MODULE_PATH=/usr/local/lib/aarch64-linux-gnu/libcamera/ipa; ros2 launch turtlebot3_bringup camera.launch.py format:=RGB888"
+  echo "[INFO] TurtleBot3 Pi camera launch requested asynchronously"
 elif pkg_exists realsense2_camera; then
   start_detached tb3_camera "ros2 launch realsense2_camera rs_launch.py enable_color:=true enable_depth:=false rgb_camera.color_profile:=640x480x15"
   echo "[INFO] RealSense camera start requested asynchronously"
-elif pkg_exists camera_ros; then
-  start_detached tb3_camera "export LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:${{LD_LIBRARY_PATH:-}}; export LIBCAMERA_IPA_MODULE_PATH=/usr/local/lib/aarch64-linux-gnu/libcamera/ipa; ros2 run camera_ros camera_node --ros-args -r __ns:=/camera"
-  echo "[INFO] camera_ros start requested asynchronously"
 else
-  echo "[SKIP] camera package not found. Install/bring up camera_ros, usb_cam, v4l2_camera, or realsense2_camera."
+  echo "[SKIP] TurtleBot3 Pi camera packages not found. Install turtlebot3_bringup and camera_ros, or bring up usb_cam, v4l2_camera, or realsense2_camera separately."
 fi
 
 echo
@@ -2486,6 +2647,9 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE="${{ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}}
 export ROS2CLI_NO_DAEMON=1
 export TURTLEBOT3_MODEL="${{TURTLEBOT3_MODEL:-burger}}"
 export LDS_MODEL="${{LDS_MODEL:-LDS-03}}"
+USER_UID="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$USER_UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 
 run() {{
   echo
@@ -2789,7 +2953,28 @@ def run_ssh_script_with_pty(
 
 def run_robot_bringup_from_state(state: "DashboardState") -> Dict[str, Any]:
     setup = state.get_setup()
-    network = setup.get("network", {})
+    robot_id, profile = active_robot_profile(setup)
+    lock = robot_operation_lock(robot_id)
+    if not lock.acquire(blocking=False):
+        return {
+            "ok": False,
+            "error": "A bringup or stop operation is already in progress for this robot. Wait for it to finish.",
+        }
+    try:
+        return _run_robot_bringup_from_state(state, setup=setup, robot_id=robot_id, profile=profile)
+    finally:
+        lock.release()
+
+
+def _run_robot_bringup_from_state(
+    state: "DashboardState",
+    setup: Optional[Dict[str, Any]] = None,
+    robot_id: Optional[str] = None,
+    profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    setup = setup or state.get_setup()
+    robot_id, selected_profile = active_robot_profile(setup) if robot_id is None else (robot_id, profile or {})
+    network = active_robot_network(setup)
     map_package: Optional[Dict[str, Any]] = None
     map_error = ""
     try:
@@ -2823,6 +3008,8 @@ def run_robot_bringup_from_state(state: "DashboardState") -> Dict[str, Any]:
     )
     return {
         "ok": bool(result.get("ok")),
+        "robotId": robot_id,
+        "robotLabel": selected_profile.get("label") or robot_id,
         "startedAt": started_at,
         "map": {
             "ok": map_package is not None,
@@ -2844,6 +3031,18 @@ def build_robot_bringup_stop_script(network: Dict[str, Any], topics: Dict[str, A
     localhost_only = shlex.quote(str(network.get("rosLocalhostOnly") or "0"))
     cmd_vel = shlex.quote(str(topics.get("cmdVel") or "/cmd_vel"))
     scan = shlex.quote(str(topics.get("scan") or "/scan"))
+    camera = shlex.quote(str(topics.get("camera") or "/camera/image_raw"))
+    compressed_camera = shlex.quote(
+        str(topics.get("compressedCamera") or "/camera/image_raw/compressed")
+    )
+    goal_action = str(topics.get("goalAction") or "/navigate_to_pose").strip() or "/navigate_to_pose"
+    nav_namespace = namespace_from_topic(goal_action, "/navigate_to_pose") or ""
+    navigation_manager = shlex.quote(
+        namespace_topic(nav_namespace, "/lifecycle_manager_navigation")
+    )
+    localization_manager = shlex.quote(
+        namespace_topic(nav_namespace, "/lifecycle_manager_localization")
+    )
     return f"""#!/usr/bin/env bash
 set +e
 source /opt/ros/jazzy/setup.bash 2>/dev/null || true
@@ -2852,35 +3051,111 @@ export ROS_DOMAIN_ID={domain}
 export ROS_LOCALHOST_ONLY={localhost_only}
 export ROS2CLI_NO_DAEMON=1
 BASE_SERVICE="turtlebot-dashboard-base.service"
+LOG_DIR="$HOME/turtlebot_dashboard_logs"
+NAVIGATION_MANAGER={navigation_manager}
+LOCALIZATION_MANAGER={localization_manager}
+USER_UID="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$USER_UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 remaining=0
+
+shutdown_nav2_lifecycle_manager() {{
+  local manager="$1"
+  local response
+  response="$(timeout -k 1 8 ros2 service call "$manager/manage_nodes" nav2_msgs/srv/ManageLifecycleNodes "{{command: 4}}" 2>&1)"
+  if printf '%s\n' "$response" | grep -Eiq 'success[=:] *true'; then
+    echo "[STOP] Nav2 lifecycle shutdown: $manager"
+    return 0
+  fi
+  echo "[INFO] Nav2 lifecycle manager unavailable or already stopped: $manager"
+  return 1
+}}
+
+stop_dashboard_tmux_session() {{
+  local session="$1"
+  local attempt
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    return 0
+  fi
+  if tmux send-keys -t "$session" C-c >/dev/null 2>&1; then
+    echo "[STOP] Ctrl+C sent to dashboard tmux $session"
+  else
+    echo "[WARN] Could not send Ctrl+C to dashboard tmux $session"
+  fi
+  for attempt in $(seq 1 12); do
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+      echo "[OK] tmux session exited after Ctrl+C: $session"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[WARN] tmux session did not exit after Ctrl+C: $session"
+  tmux kill-session -t "$session" >/dev/null 2>&1 || true
+  echo "[FALLBACK] tmux session force-closed: $session"
+  return 1
+}}
+
+stop_dashboard_nohup_process() {{
+  local name="$1"
+  local pid_file="$LOG_DIR/${{name}}.pid"
+  local pid
+  local attempt
+  if [ ! -s "$pid_file" ]; then
+    return 0
+  fi
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pid_file"
+    return 0
+  fi
+  kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
+  echo "[STOP] SIGINT sent to dashboard nohup process group $name (pid $pid)"
+  for attempt in $(seq 1 12); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$pid_file"
+      echo "[OK] nohup process exited after SIGINT: $name"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[WARN] nohup process did not exit after SIGINT: $name"
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 3
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    echo "[FALLBACK] nohup process group force-closed: $name"
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pid_file"
+  fi
+  return 1
+}}
 
 echo "== dashboard robot bringup stop =="
 timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/Twist "{{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}" >/dev/null 2>&1 || true
 timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/TwistStamped "{{twist: {{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}}}" >/dev/null 2>&1 || true
+
+# Nav2 needs its lifecycle state machine to shut down before the launch process exits.
+shutdown_nav2_lifecycle_manager "$NAVIGATION_MANAGER" || true
+shutdown_nav2_lifecycle_manager "$LOCALIZATION_MANAGER" || true
+stop_dashboard_tmux_session tb3_nav2 || true
+stop_dashboard_tmux_session tb3_camera || true
+stop_dashboard_nohup_process tb3_nav2 || true
+stop_dashboard_nohup_process tb3_camera || true
+
 if ! systemctl --user show-environment >/dev/null 2>&1; then
   echo "[FAIL] systemd user manager is unavailable; base service stop cannot be verified."
   remaining=1
 elif systemctl --user is-active --quiet "$BASE_SERVICE"; then
   systemctl --user stop "$BASE_SERVICE"
-  echo "[STOP] systemd $BASE_SERVICE"
+  echo "[STOP] systemd $BASE_SERVICE (SIGINT control group)"
 else
   echo "[INFO] $BASE_SERVICE is not active"
 fi
 
 # Compatibility cleanup for an older dashboard-managed tmux base session.
 # A manually launched terminal session is intentionally not targeted here.
-if tmux has-session -t tb3_base 2>/dev/null; then
-  tmux send-keys -t tb3_base C-c >/dev/null 2>&1 || true
-  sleep 3
-  tmux kill-session -t tb3_base >/dev/null 2>&1 || true
-  echo "[STOP] legacy tmux tb3_base"
-fi
-for session in tb3_nav2 tb3_camera; do
-  tmux kill-session -t "$session" >/dev/null 2>&1 && echo "[STOP] tmux $session" || true
-done
-pkill -f "[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[b]ehavior_server|[c]ollision_monitor|[l]ifecycle_manager_navigation|[t]urtlebot3_navigation2|[n]av2_bringup" >/dev/null 2>&1 && echo "[STOP] nav2" || true
-pkill -f "[c]amera_ros|[c]amera_node|[r]ealsense2_camera|[u]sb_cam|[v]4l2_camera" >/dev/null 2>&1 && echo "[STOP] camera" || true
-sleep 2
+stop_dashboard_tmux_session tb3_base || true
 
 echo "== dashboard bringup stop verification =="
 if ! systemctl --user show-environment >/dev/null 2>&1; then
@@ -2901,6 +3176,22 @@ for session in tb3_nav2 tb3_camera; do
     echo "[OK] tmux session stopped: $session"
   fi
 done
+nav2_processes="$(pgrep -af '[m]ap_server|[a]mcl|[c]ontroller_server|[p]lanner_server|[b]t_navigator|[b]ehavior_server|[c]ollision_monitor|[l]ifecycle_manager_(navigation|localization)|[t]urtlebot3_navigation2|[n]av2_bringup' || true)"
+if [ -n "$nav2_processes" ]; then
+  echo "[FAIL] Nav2 processes still active (not force-killed):"
+  echo "$nav2_processes"
+  remaining=1
+else
+  echo "[OK] Nav2 processes stopped"
+fi
+camera_processes="$(pgrep -af '[c]amera_ros|[c]amera_node|[c]amera.launch.py|[r]ealsense2_camera|[u]sb_cam|[v]4l2_camera' || true)"
+if [ -n "$camera_processes" ]; then
+  echo "[FAIL] Camera processes still active (not force-killed):"
+  echo "$camera_processes"
+  remaining=1
+else
+  echo "[OK] Camera processes stopped"
+fi
 scan_info="$(timeout -k 1 4 ros2 topic info {cmd_vel} -v 2>/dev/null || true)"
 cmd_subscribers="$(printf '%s\n' "$scan_info" | sed -n 's/^Subscription count: *//p' | head -1)"
 echo "[INFO] {cmd_vel} subscribers after stop: ${{cmd_subscribers:-unknown}}"
@@ -2909,6 +3200,20 @@ scan_publishers="$(printf '%s\n' "$scan_info" | sed -n 's/^Publisher count: *//p
 echo "[INFO] {scan} publishers after stop: ${{scan_publishers:-unknown}}"
 if [ -n "$scan_publishers" ] && [ "$scan_publishers" != "0" ]; then
   echo "[FAIL] {scan} still has publishers. It may be a manually started or external LiDAR driver."
+  remaining=1
+fi
+camera_info="$(timeout -k 1 4 ros2 topic info {camera} -v 2>/dev/null || true)"
+camera_publishers="$(printf '%s\n' "$camera_info" | sed -n 's/^Publisher count: *//p' | head -1)"
+echo "[INFO] {camera} publishers after stop: ${{camera_publishers:-unknown}}"
+if [ -n "$camera_publishers" ] && [ "$camera_publishers" != "0" ]; then
+  echo "[FAIL] {camera} still has publishers"
+  remaining=1
+fi
+compressed_camera_info="$(timeout -k 1 4 ros2 topic info {compressed_camera} -v 2>/dev/null || true)"
+compressed_camera_publishers="$(printf '%s\n' "$compressed_camera_info" | sed -n 's/^Publisher count: *//p' | head -1)"
+echo "[INFO] {compressed_camera} publishers after stop: ${{compressed_camera_publishers:-unknown}}"
+if [ -n "$compressed_camera_publishers" ] && [ "$compressed_camera_publishers" != "0" ]; then
+  echo "[FAIL] {compressed_camera} still has publishers"
   remaining=1
 fi
 if [ "$remaining" -ne 0 ]; then
@@ -2921,10 +3226,33 @@ echo "[OK] dashboard bringup stopped and verified"
 
 def run_robot_bringup_stop_from_state(state: "DashboardState") -> Dict[str, Any]:
     setup = state.get_setup()
+    robot_id, profile = active_robot_profile(setup)
+    lock = robot_operation_lock(robot_id)
+    if not lock.acquire(blocking=False):
+        return {
+            "ok": False,
+            "error": "A bringup or stop operation is already in progress for this robot. Wait for it to finish.",
+        }
+    try:
+        return _run_robot_bringup_stop_from_state(state, setup=setup, robot_id=robot_id, profile=profile)
+    finally:
+        lock.release()
+
+
+def _run_robot_bringup_stop_from_state(
+    state: "DashboardState",
+    setup: Optional[Dict[str, Any]] = None,
+    robot_id: Optional[str] = None,
+    profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    setup = setup or state.get_setup()
+    robot_id, selected_profile = active_robot_profile(setup) if robot_id is None else (robot_id, profile or {})
+    network = active_robot_network(setup)
+    topics = selected_profile.get("topics") if isinstance(selected_profile.get("topics"), dict) else setup.get("topics", {})
     started_at = now_iso()
     result = run_ssh_script(
-        setup.get("network", {}),
-        build_robot_bringup_stop_script(setup.get("network", {}), setup.get("topics", {})),
+        network,
+        build_robot_bringup_stop_script(network, topics),
         timeout=40.0,
     )
     state.update_runtime(
@@ -2938,13 +3266,14 @@ def run_robot_bringup_stop_from_state(state: "DashboardState") -> Dict[str, Any]
             "lastRobotBringupStopAt": started_at,
         }
     )
-    return {**result, "stoppedAt": started_at}
+    return {**result, "stoppedAt": started_at, "robotId": robot_id, "robotLabel": selected_profile.get("label") or robot_id}
 
 
 def run_robot_ssh_check_from_state(state: "DashboardState", detailed: bool = False) -> Dict[str, Any]:
     setup = state.get_setup()
-    network = setup.get("network", {})
-    topics = setup.get("topics", {})
+    robot_id, profile = active_robot_profile(setup)
+    network = active_robot_network(setup)
+    topics = profile.get("topics") if isinstance(profile.get("topics"), dict) else setup.get("topics", {})
     script = build_robot_ssh_diagnostics_script(network, topics, detailed=detailed)
     started_at = now_iso()
     result = run_ssh_script(network, script, timeout=150.0 if detailed else 35.0)
@@ -2960,6 +3289,8 @@ def run_robot_ssh_check_from_state(state: "DashboardState", detailed: bool = Fal
     )
     return {
         "ok": bool(result.get("ok")),
+        "robotId": robot_id,
+        "robotLabel": profile.get("label") or robot_id,
         "detailed": detailed,
         "startedAt": started_at,
         "command": result.get("command"),
@@ -3358,6 +3689,7 @@ class DashboardState:
         snapshot = self.snapshot()
         setup = snapshot.setdefault("setup", {})
         setup["network"] = public_network(setup.get("network", {}))
+        setup["robotProfiles"] = public_robot_profiles(setup.get("robotProfiles", {}))
         return snapshot
 
     def get_setup(self) -> Dict[str, Any]:
@@ -3441,6 +3773,17 @@ class DashboardState:
                 }
         if status_event:
             self.log_run_event("nav_status", **status_event)
+
+    def update_robot_pose(self, robot_id: str, pose: Dict[str, Any]) -> None:
+        """Store a non-active robot pose without replacing the active robot pose."""
+        with self._lock:
+            runtime = self._state.setdefault("runtime", {})
+            poses = runtime.setdefault("robotPoses", {})
+            poses[robot_id] = pose
+
+    def replace_robot_poses(self, poses: Dict[str, Any]) -> None:
+        with self._lock:
+            self._state.setdefault("runtime", {})["robotPoses"] = poses
 
     def log_run_event(self, event_type: str, **data: Any) -> None:
         self.run_logs.record(event_type, **data)
@@ -4160,6 +4503,7 @@ class RosBridge:
         self.setup = state.get_setup()
         self.topics = self.setup["topics"]
         self.node = None
+        self.ros_context = None
         self.goal_handle = None
         self.route_goal_handle = None
         self._last_odom_pose: Optional[Tuple[float, float, float]] = None
@@ -4207,8 +4551,8 @@ class RosBridge:
         try:
             import rclpy
             from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped
-            from nav_msgs.msg import Odometry
             from rclpy.action import ActionClient
+            from rclpy.context import Context
             from rclpy.node import Node
             from rclpy.qos import qos_profile_sensor_data
             from sensor_msgs.msg import CompressedImage, Image, LaserScan
@@ -4231,13 +4575,16 @@ class RosBridge:
         self.NavigateThroughPoses = NavigateThroughPoses
         self.sensor_qos = qos_profile_sensor_data
 
-        if not rclpy.ok():
-            rclpy.init(args=None)
+        _robot_id, profile = active_robot_profile(self.setup)
+        connection = profile.get("connection") if isinstance(profile.get("connection"), dict) else {}
+        domain_id = int(connection.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or 1)
+        self.ros_context = Context()
+        self.ros_context.init(args=None, initialize_logging=False, domain_id=domain_id)
 
         class DashboardNode(Node):
             pass
 
-        self.node = DashboardNode("turtlebot_web_dashboard")
+        self.node = DashboardNode("turtlebot_web_dashboard", context=self.ros_context)
         qos = 10
         self.initial_pose_pub = self.node.create_publisher(
             PoseWithCovarianceStamped, self.topics["initialPose"], qos
@@ -4287,7 +4634,7 @@ class RosBridge:
 
     def _spin_node(self, node: Any) -> None:
         try:
-            self.rclpy.spin(node)
+            self.rclpy.spin(node, context=self.ros_context)
         except Exception as exc:
             if not self._shutdown_event.is_set():
                 self.state.update_runtime(
@@ -4302,6 +4649,13 @@ class RosBridge:
                 node.destroy_node()
             except Exception:
                 pass
+        context = getattr(self, "ros_context", None)
+        if context is not None:
+            try:
+                context.try_shutdown()
+            except Exception:
+                pass
+        self.ros_context = None
         self.node = None
         if not hasattr(self, "_fallback"):
             self._fallback = NullRosBridge(self.state)
@@ -4332,6 +4686,14 @@ class RosBridge:
                 pass
         if self._spin_thread and self._spin_thread.is_alive():
             self._spin_thread.join(timeout=1.0)
+
+        old_context = self.ros_context
+        if old_context is not None:
+            try:
+                old_context.try_shutdown()
+            except Exception:
+                pass
+        self.ros_context = None
 
         self.setup = next_setup
         self.topics = self.setup["topics"]
@@ -4508,7 +4870,12 @@ class RosBridge:
         runtime = snapshot.get("runtime", {}) or {}
         dynamic_obstacles = runtime.get("dynamicLidarObstacles", []) or []
         return fallback_replan_path(
-            snapshot.get("setup", {}) or {}, pose, route, route_index, dynamic_obstacles
+            snapshot.get("setup", {}) or {},
+            pose,
+            route,
+            route_index,
+            dynamic_obstacles,
+            runtime.get("robotPoses", {}) or {},
         )
 
     def _on_scan(self, msg: Any) -> None:
@@ -7202,8 +7569,8 @@ class RosBridge:
             except Exception:
                 pass
         try:
-            if self.rclpy.ok():
-                self.rclpy.shutdown()
+            if self.ros_context is not None:
+                self.ros_context.try_shutdown()
         except Exception:
             pass
         if self._spin_thread and self._spin_thread.is_alive():
@@ -7639,10 +8006,125 @@ class RosBridge:
         }
 
 
+class RobotPoseMonitor:
+    """A small ROS2 worker bound to one profile's ROS_DOMAIN_ID.
+
+    ROS 2 contexts can coexist in one process.  The active profile keeps the
+    full control bridge, while these workers subscribe to each other profile's
+    AMCL/odom pose so their current bodies can be shown as avoidance obstacles.
+    """
+
+    def __init__(self, state: DashboardState, robot_id: str, profile: Dict[str, Any]) -> None:
+        self.state = state
+        self.robot_id = robot_id
+        self.profile = profile
+        self.node = None
+        self.context = None
+        self.rclpy = None
+        self.thread: Optional[threading.Thread] = None
+        self._stopped = threading.Event()
+        self._last_amcl = 0.0
+        self._start()
+
+    def _start(self) -> None:
+        try:
+            import rclpy
+            from geometry_msgs.msg import PoseWithCovarianceStamped
+            from nav_msgs.msg import Odometry
+            from rclpy.context import Context
+            from rclpy.node import Node
+
+            connection = self.profile.get("connection") if isinstance(self.profile.get("connection"), dict) else {}
+            domain_id = int(connection.get("rosDomainId") or 1)
+            self.rclpy = rclpy
+            self.context = Context()
+            self.context.init(args=None, initialize_logging=False, domain_id=domain_id)
+            self.node = Node(f"turtlebot_pose_{self.robot_id}", context=self.context)
+            topics = self.profile.get("topics") if isinstance(self.profile.get("topics"), dict) else {}
+            self.node.create_subscription(PoseWithCovarianceStamped, topics.get("pose", "/amcl_pose"), self._on_amcl, 10)
+            self.thread = threading.Thread(target=self._spin, daemon=True, name=f"pose-{self.robot_id}")
+            self.thread.start()
+        except Exception as exc:
+            self.state.update_robot_pose(
+                self.robot_id,
+                {"available": False, "error": str(exc), "stamp": now_iso()},
+            )
+
+    def _spin(self) -> None:
+        try:
+            self.rclpy.spin(self.node, context=self.context)
+        except Exception as exc:
+            if not self._stopped.is_set():
+                self.state.update_robot_pose(
+                    self.robot_id,
+                    {"available": False, "error": str(exc), "stamp": now_iso()},
+                )
+
+    def _save_pose(self, pose: Any, source: str) -> None:
+        yaw = quaternion_to_yaw(
+            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w
+        )
+        self.state.update_robot_pose(
+            self.robot_id,
+            {
+                "available": True,
+                "x": float(pose.position.x),
+                "y": float(pose.position.y),
+                "yaw": yaw,
+                "source": source,
+                "stamp": now_iso(),
+            },
+        )
+
+    def _on_amcl(self, msg: Any) -> None:
+        self._last_amcl = time.monotonic()
+        self._save_pose(msg.pose.pose, "amcl")
+
+    def shutdown(self) -> None:
+        self._stopped.set()
+        try:
+            if self.node is not None:
+                self.node.destroy_node()
+        except Exception:
+            pass
+        try:
+            if self.context is not None:
+                self.context.try_shutdown()
+        except Exception:
+            pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+
+class RobotPoseMonitorManager:
+    def __init__(self, state: DashboardState) -> None:
+        self.state = state
+        self.monitors: Dict[str, RobotPoseMonitor] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        self.shutdown()
+        setup = self.state.get_setup()
+        active_robot, _ = active_robot_profile(setup)
+        profiles = setup.get("robotProfiles") if isinstance(setup.get("robotProfiles"), dict) else {}
+        retained_poses: Dict[str, Any] = {}
+        for robot_id, profile in profiles.items():
+            if robot_id == active_robot or not isinstance(profile, dict):
+                continue
+            self.monitors[robot_id] = RobotPoseMonitor(self.state, robot_id, profile)
+        self.state.replace_robot_poses(retained_poses)
+
+    def shutdown(self) -> None:
+        for monitor in self.monitors.values():
+            monitor.shutdown()
+        self.monitors = {}
+
+
 @dataclass
 class AppContext:
     state: DashboardState
     ros: RosBridge
+    pose_monitors: RobotPoseMonitorManager
 
 
 class DashboardHttpServer(ThreadingHTTPServer):
@@ -7850,6 +8332,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     network_patch.pop("robotSshPasswordConfigured", None)
                     if not str(network_patch.get("robotSshPassword") or ""):
                         network_patch.pop("robotSshPassword", None)
+                profile_patch = body.get("robotProfiles")
+                if isinstance(profile_patch, dict):
+                    for profile in profile_patch.values():
+                        if not isinstance(profile, dict):
+                            continue
+                        connection = profile.get("connection")
+                        if isinstance(connection, dict):
+                            connection.pop("robotSshPasswordConfigured", None)
+                            if not str(connection.get("robotSshPassword") or ""):
+                                connection.pop("robotSshPassword", None)
                 map_data = body.pop("mapImageDataUrl", None)
                 if map_data:
                     image_url = save_data_url(map_data)
@@ -7882,8 +8374,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     self.context.ros.cancel_goal()
                 synchronize_active_robot_topics(body, old_setup)
                 self.context.state.update_setup(body)
+                self.context.pose_monitors.reload()
                 reload_result = None
-                if body.get("topics") and body.get("topics") != old_topics:
+                if any(key in body for key in ("topics", "activeRobot", "robotProfiles", "network")):
                     reload_result = self.context.ros.reload_setup()
                 initial_pose_result = None
                 if initial_pose_changed and initial_pose_values is not None:
@@ -7908,6 +8401,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 patch = {"activeRobot": active_robot, "topics": updated_topics}
                 synchronize_active_robot_topics(patch, setup)
                 self.context.state.update_setup(patch)
+                self.context.pose_monitors.reload()
                 result["rosReload"] = self.context.ros.reload_setup()
                 if not result["rosReload"].get("ok"):
                     self.context.state.replace_setup(setup)
@@ -8212,11 +8706,13 @@ def main() -> None:
     CONFIG_ROOT.mkdir(exist_ok=True)
     state = DashboardState()
     ros = RosBridge(state)
-    DashboardHandler.context = AppContext(state=state, ros=ros)
+    pose_monitors = RobotPoseMonitorManager(state)
+    DashboardHandler.context = AppContext(state=state, ros=ros, pose_monitors=pose_monitors)
     try:
         server = DashboardHttpServer((args.host, args.port), DashboardHandler)
     except OSError as exc:
         ros.shutdown()
+        pose_monitors.shutdown()
         state.run_logs.close()
         raise SystemExit(
             f"Dashboard could not start on {args.host}:{args.port}. "
@@ -8233,6 +8729,7 @@ def main() -> None:
             ros.shutdown()
         finally:
             try:
+                pose_monitors.shutdown()
                 state.run_logs.close()
             finally:
                 server.server_close()

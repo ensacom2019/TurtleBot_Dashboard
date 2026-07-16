@@ -42,7 +42,15 @@ const DEFAULT_ROBOT_PROFILES = {
     namespace: "/",
     body: { length: 0.18, width: 0.14 },
     mapPose: { enabled: false, x: null, y: null, yaw: 0 },
-    topics: topicsForNamespace("/", "camera_ros"),
+    connection: {
+      robotIp: "192.168.20.7",
+      rosDomainId: "1",
+      rosLocalhostOnly: "0",
+      robotSshHost: "192.168.20.7",
+      robotSshUser: "kim",
+      robotSshPassword: "",
+    },
+    topics: topicsForNamespace("/", "plain"),
   },
 };
 
@@ -116,7 +124,8 @@ function bindElements() {
     "robotCheckButton",
     "copyDiagnosticsButton",
     "refreshConnectionButton",
-    "discoverRobotButton",
+    "addRobotProfileButton",
+    "deleteRobotProfileButton",
     "resetTopicsButton",
     "robotCheckResults",
     "diagnosticReport",
@@ -252,7 +261,8 @@ function bindActions() {
   els.downloadRunLogsButton.addEventListener("click", downloadRunLogs);
   els.clearRunLogsButton.addEventListener("click", clearRunLogs);
   els.refreshConnectionButton.addEventListener("click", refreshConnectionStatus);
-  els.discoverRobotButton.addEventListener("click", discoverRobots);
+  els.addRobotProfileButton.addEventListener("click", addRobotProfile);
+  els.deleteRobotProfileButton.addEventListener("click", deleteActiveRobotProfile);
   els.resetTopicsButton.addEventListener("click", resetTopicsFromRobot);
   els.robotDiscoveryNoticeClose.addEventListener("click", closeRobotDiscoveryNotice);
   els.robotDiscoveryNoticeCloseButton.addEventListener("click", closeRobotDiscoveryNotice);
@@ -494,13 +504,15 @@ function fillSetupForm(setup) {
   renderRobotProfileControls(setup);
   renderOtherRobotList(setup);
   setInputIfIdle(els.activeRobotProfile, setup.activeRobot || "tb3_2");
-  setInputIfIdle(els.robotIp, setup.network?.robotIp ?? "");
+  const activeProfile = normalizedRobotProfiles(setup)[setup.activeRobot || "tb3_2"] || {};
+  const connection = activeProfile.connection || setup.network || {};
+  setInputIfIdle(els.robotIp, connection.robotIp ?? "");
   setInputIfIdle(els.serverIp, setup.network?.serverIp ?? "");
-  setInputIfIdle(els.rosDomainId, setup.network?.rosDomainId ?? "");
-  setInputIfIdle(els.rosLocalhostOnly, setup.network?.rosLocalhostOnly ?? "");
-  setInputIfIdle(els.robotSshHost, setup.network?.robotSshHost ?? setup.network?.robotIp ?? "");
-  setInputIfIdle(els.robotSshUser, setup.network?.robotSshUser ?? "");
-  setInputIfIdle(els.robotSshPassword, setup.network?.robotSshPassword ?? "");
+  setInputIfIdle(els.rosDomainId, connection.rosDomainId ?? "");
+  setInputIfIdle(els.rosLocalhostOnly, connection.rosLocalhostOnly ?? "");
+  setInputIfIdle(els.robotSshHost, connection.robotSshHost ?? connection.robotIp ?? "");
+  setInputIfIdle(els.robotSshUser, connection.robotSshUser ?? "");
+  setInputIfIdle(els.robotSshPassword, connection.robotSshPassword ?? "");
   els.robotSshPassword.placeholder = setup.network?.robotSshPasswordConfigured ? "저장된 비밀번호 사용" : "";
   setInputIfIdle(els.initialX, setup.initialPose.x);
   setInputIfIdle(els.initialY, setup.initialPose.y);
@@ -827,9 +839,15 @@ function closeRobotDiscoveryNotice() {
   if (els.robotDiscoveryNotice.open) els.robotDiscoveryNotice.close();
 }
 
+async function persistSelectedRobotBeforeControl() {
+  if (!state.setupDirty) return;
+  await saveSetup({ successMessage: "선택 로봇 설정을 저장했습니다." });
+}
+
 async function checkRobot() {
   els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>체크 중...</p></div>`;
   try {
+    await persistSelectedRobotBeforeControl();
     const payload = await fetchJson("/api/robot_check");
     fillConnectionStatus(payload);
     renderRobotCheckResults(payload);
@@ -844,6 +862,7 @@ async function robotBringup() {
   els.diagnosticReport.classList.add("visible");
   els.diagnosticReport.value = "로봇 SSH 브링업 실행 중...";
   try {
+    await persistSelectedRobotBeforeControl();
     const payload = await postJson("/api/robot_bringup", {});
     const mapLine = payload.map?.ok
       ? `map: ${payload.map.source || "-"} (${payload.map.width}x${payload.map.height}, ${payload.map.resolution} m/px)`
@@ -886,6 +905,7 @@ async function stopRobotBringup() {
   els.diagnosticReport.classList.add("visible");
   els.diagnosticReport.value = "SSH로 로봇 브링업 종료 중...";
   try {
+    await persistSelectedRobotBeforeControl();
     const payload = await postJson("/api/robot_bringup_stop", {});
     const output = [
       `$ ${payload.command || "robot bringup stop"}`,
@@ -920,6 +940,7 @@ async function robotSshCheck(detailed = false) {
   els.diagnosticReport.value = detailed ? "로봇 SSH 상세점검 중..." : "로봇 SSH 빠른점검 중...";
   els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>SSH로 로봇 내부 상태 확인 중...</p></div>`;
   try {
+    await persistSelectedRobotBeforeControl();
     const payload = await postJson("/api/robot_ssh_check", { detailed });
     const output = [
       `$ ${payload.command || "robot ssh diagnostics"}`,
@@ -1356,7 +1377,15 @@ function applyRobotProfile(profileId) {
   const profile = profiles[profileId];
   if (!profile) return;
   const topics = profile.topics || {};
+  const connection = profile.connection || {};
   els.activeRobotProfile.value = profileId;
+  els.robotIp.value = connection.robotIp || "";
+  els.rosDomainId.value = connection.rosDomainId || "";
+  els.rosLocalhostOnly.value = connection.rosLocalhostOnly || "0";
+  els.robotSshHost.value = connection.robotSshHost || connection.robotIp || "";
+  els.robotSshUser.value = connection.robotSshUser || "";
+  els.robotSshPassword.value = "";
+  els.robotSshPassword.placeholder = connection.robotSshPasswordConfigured ? "Saved password will be used" : "";
   if (topics.scan) els.topicScan.value = topics.scan;
   if (topics.odom) els.topicOdom.value = topics.odom;
   if (topics.pose) els.topicPose.value = topics.pose;
@@ -1371,6 +1400,67 @@ function applyRobotProfile(profileId) {
   renderOtherRobotList({ ...currentSetup(), activeRobot: profileId });
   markSetupDirty();
   toast(`${profile.label} 토픽을 적용했습니다. 저장하면 연결 대상이 바뀝니다.`);
+}
+
+function addRobotProfile() {
+  if (!state.data?.setup) return;
+  const profiles = normalizedRobotProfiles(state.data.setup);
+  let index = 1;
+  while (profiles[`tb3_${index}`]) index += 1;
+  const usedDomains = new Set(
+    Object.values(profiles).map((profile) => Number(profile.connection?.rosDomainId)).filter(Number.isFinite),
+  );
+  let domain = 1;
+  while (usedDomains.has(domain)) domain += 1;
+  const id = `tb3_${index}`;
+  profiles[id] = {
+    label: `TurtleBot ${index}`,
+    namespace: "/",
+    source: "manual",
+    body: { length: 0.18, width: 0.14 },
+    mapPose: { enabled: false, x: null, y: null, yaw: 0 },
+    connection: {
+      robotIp: "",
+      rosDomainId: String(domain),
+      rosLocalhostOnly: "0",
+      robotSshHost: "",
+      robotSshUser: "",
+      robotSshPassword: "",
+    },
+    topics: topicsForNamespace("/", "plain"),
+  };
+  state.data.setup.robotProfiles = profiles;
+  state.data.setup.activeRobot = id;
+  renderRobotProfileControls(state.data.setup);
+  applyRobotProfile(id);
+  markSetupDirty();
+  toast("새 로봇을 추가했습니다. IP, SSH, ROS Domain을 입력한 뒤 저장하세요.");
+}
+
+function deleteActiveRobotProfile() {
+  if (!state.data?.setup) return;
+  const setup = currentSetup();
+  const profiles = { ...setup.robotProfiles };
+  const activeRobot = setup.activeRobot;
+  const profileIds = Object.keys(profiles);
+  if (profileIds.length <= 1) {
+    toast("마지막 로봇 프로필은 삭제할 수 없습니다.");
+    return;
+  }
+  const label = profiles[activeRobot]?.label || activeRobot;
+  if (!window.confirm(`${label} 프로필을 삭제할까요?`)) return;
+  delete profiles[activeRobot];
+  const nextRobot = Object.keys(profiles)[0];
+  state.data.setup = {
+    ...state.data.setup,
+    ...setup,
+    activeRobot: nextRobot,
+    robotProfiles: profiles,
+  };
+  renderRobotProfileControls(state.data.setup);
+  applyRobotProfile(nextRobot);
+  markSetupDirty();
+  toast(`${label} 프로필을 삭제했습니다. 저장하면 적용됩니다.`);
 }
 
 function escapeHtml(value) {
@@ -1912,6 +2002,20 @@ function currentSetup() {
   const activeRobot = els.activeRobotProfile?.value || fallback.activeRobot || "tb3_2";
   const topics = currentTopicInputs();
   const robotProfiles = currentRobotProfiles(fallback, activeRobot, topics);
+  const connection = {
+    robotIp: els.robotIp.value.trim(),
+    rosDomainId: els.rosDomainId.value.trim(),
+    rosLocalhostOnly: els.rosLocalhostOnly.value.trim(),
+    robotSshHost: els.robotSshHost.value.trim(),
+    robotSshUser: els.robotSshUser.value.trim(),
+    robotSshPassword: els.robotSshPassword.value,
+  };
+  if (robotProfiles[activeRobot]) {
+    robotProfiles[activeRobot] = {
+      ...robotProfiles[activeRobot],
+      connection: { ...(robotProfiles[activeRobot].connection || {}), ...connection },
+    };
+  }
   return {
     map: {
       ...(fallback.map || {}),
@@ -1979,13 +2083,8 @@ function currentSetup() {
       freeCells: normalizeBlockedCells(fallback.planner?.freeCells || []),
     },
     network: {
-      robotIp: els.robotIp.value.trim(),
       serverIp: els.serverIp.value.trim(),
-      rosDomainId: els.rosDomainId.value.trim(),
-      rosLocalhostOnly: els.rosLocalhostOnly.value.trim(),
-      robotSshHost: els.robotSshHost.value.trim(),
-      robotSshUser: els.robotSshUser.value.trim(),
-      robotSshPassword: els.robotSshPassword.value,
+      ...connection,
     },
     activeRobot,
     robotProfiles,
@@ -2027,7 +2126,7 @@ function normalizedRobotProfiles(setup = state.data?.setup || {}) {
     const profile = rawProfile || {};
     const fallback = DEFAULT_ROBOT_PROFILES[id] || {};
     const namespace = profile.namespace || fallback.namespace || `/${id}`;
-    const cameraStyle = id === "tb3_2" ? "camera_ros" : "color";
+    const cameraStyle = id === "tb3_2" ? "plain" : "color";
     profiles[id] = {
       ...profile,
       label: profile.label || fallback.label || id,
@@ -2035,6 +2134,10 @@ function normalizedRobotProfiles(setup = state.data?.setup || {}) {
       source: profile.source || fallback.source || "",
       body: normalizedRobotBody(profile.body || fallback.body),
       mapPose: normalizedRobotMapPose(profile.mapPose || fallback.mapPose),
+      connection: {
+        ...(fallback.connection || {}),
+        ...(profile.connection || {}),
+      },
       topics: {
         ...topicsForNamespace(namespace, cameraStyle),
         ...(fallback.topics || {}),
@@ -2070,17 +2173,20 @@ function optionalFiniteNumber(value) {
 
 function avoidanceRobotObstacles(setup) {
   const activeRobot = setup.activeRobot || "tb3_2";
+  const livePoses = state.data?.runtime?.robotPoses || {};
   return Object.entries(normalizedRobotProfiles(setup))
-    .filter(([id, profile]) => id !== activeRobot && profile.mapPose.enabled)
+    .filter(([id, profile]) => id !== activeRobot && (livePoses[id]?.available || profile.mapPose.enabled))
     .map(([id, profile]) => {
-      const cosYaw = Math.abs(Math.cos(profile.mapPose.yaw));
-      const sinYaw = Math.abs(Math.sin(profile.mapPose.yaw));
+      const livePose = livePoses[id]?.available ? livePoses[id] : null;
+      const pose = livePose || profile.mapPose;
+      const cosYaw = Math.abs(Math.cos(pose.yaw));
+      const sinYaw = Math.abs(Math.sin(pose.yaw));
       return {
         id: `robot-${id}`,
         label: profile.label,
-        x: profile.mapPose.x,
-        y: profile.mapPose.y,
-        yaw: profile.mapPose.yaw,
+        x: pose.x,
+        y: pose.y,
+        yaw: pose.yaw,
         bodyLength: profile.body.length,
         bodyWidth: profile.body.width,
         width: profile.body.length * cosYaw + profile.body.width * sinYaw,

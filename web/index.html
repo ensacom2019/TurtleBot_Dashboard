@@ -264,8 +264,9 @@
                 <label>
                   Active Robot
                   <select id="activeRobotProfile"></select>
+                  <button id="addRobotProfileButton" class="icon-button" type="button" title="Add robot manually" aria-label="Add robot manually">+</button>
+                  <button id="deleteRobotProfileButton" class="icon-button" type="button" title="선택 로봇 삭제" aria-label="선택 로봇 삭제">&#215;</button>
                 </label>
-                <button id="discoverRobotButton" class="icon-button" type="button" title="같은 네트워크에서 ROS 로봇 검색" aria-label="같은 네트워크에서 ROS 로봇 검색">&#128269;</button>
               </div>
             </div>
             <div class="robot-pose-box">
@@ -352,9 +353,9 @@
               <div class="footprint-head">
                 <h2>연결 상태</h2>
                 <div class="button-row">
-                  <button id="robotBringupButton" type="button" class="primary">로봇 브링업</button>
+                  <button id="robotBringupButton" type="button" class="primary">선택 로봇 브링업</button>
                   <button id="robotSshDetailButton" type="button">SSH 상세점검</button>
-                  <button id="robotBringupStopButton" type="button" class="danger">브링업 종료</button>
+                  <button id="robotBringupStopButton" type="button" class="danger">선택 로봇 종료</button>
                   <button id="robotCheckButton" type="button">로봇 체크</button>
                   <button id="copyDiagnosticsButton" type="button">진단 복사</button>
                   <button id="refreshConnectionButton" type="button">새로고침</button>

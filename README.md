@@ -2,6 +2,12 @@
 
 TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지도 설정, A* 경로 계획, LiDAR 기반 비상 주행, 수동 운전, 카메라 확인, 로봇 SSH 브링업을 한 화면에서 다룹니다.
 
+## 다중 로봇 (서로 다른 ROS Domain)
+
+자동 네트워크 검색은 사용하지 않습니다. 셋업의 `+` 버튼으로 로봇 프로필을 직접 추가하고, **각 프로필별로** Robot IP, SSH Host/User/Password, `ROS_DOMAIN_ID`를 입력해 저장합니다. 각 로봇은 반드시 서로 다른 Domain을 사용하며, 토픽 이름은 모두 `/scan`, `/amcl_pose`처럼 같아도 됩니다.
+
+프로필을 선택하면 그 로봇만 제어 대상이 됩니다. `선택 로봇 브링업`과 `선택 로봇 종료`는 선택한 프로필의 SSH와 Domain으로만 동작합니다. 다른 프로필은 Domain별 ROS worker가 pose를 구독하여 지도상의 회피 장애물로 반영하며, pose를 아직 받지 못한 경우에는 수동 위치값을 사용합니다.
+
 ## 화면
 
 ### 셋업 대시보드
@@ -35,7 +41,7 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 - 카메라 화면, 수동 주행, 주행 로그, 진단 보고서
 - ROS 2 토픽 설정, 로봇 탭 선택, 같은 사설 네트워크의 SSH 장비 및 ROS 로봇 검색, 로봇 체크
 - SSH 브링업: OpenCR 포트 검증 후 systemd 사용자 서비스로 TurtleBot base를 실행하고 Nav2/AMCL, 카메라를 시작
-- SSH 브링업 종료: base 서비스 cgroup에 SIGINT를 보내 LiDAR를 포함한 자식 프로세스를 정상 종료
+- SSH 브링업 종료: Nav2 lifecycle shutdown과 Ctrl+C(SIGINT) 후 검증을 거쳐 base·LiDAR·Nav2·카메라를 정상 종료
 
 ## 요구 사항
 
@@ -96,7 +102,7 @@ python server.py --host 127.0.0.1 --port 8080
 | 초기 위치 | `/initialpose` |
 | 단일 목표 | `/navigate_to_pose` |
 | 경유지 목표 | `/navigate_through_poses` |
-| 카메라 | `/camera/camera/image_raw` |
+| 카메라 | `/camera/image_raw` |
 
 `tb3_1` 프로필은 `/tb3_1/...` namespace를 사용합니다. 토픽명과 네트워크 값은 셋업 탭에서 변경할 수 있습니다.
 
@@ -125,7 +131,7 @@ python server.py --host 127.0.0.1 --port 8080
 sudo loginctl enable-linger kim
 ```
 
-`브링업 종료`는 먼저 정지 명령을 보내고 `systemctl --user stop turtlebot-dashboard-base.service`로 base 서비스 cgroup 전체에 `SIGINT`를 전달합니다. 따라서 `ros2 launch`의 LiDAR 드라이버 자식 프로세스도 `Ctrl+C`와 같은 순서로 종료됩니다. Nav2와 카메라 세션도 함께 종료합니다.
+`브링업 종료`는 먼저 정지 명령을 보내고 Nav2 lifecycle manager에 shutdown을 요청합니다. 이어 dashboard가 만든 Nav2·카메라 tmux 세션에 `Ctrl+C`를 보내 최대 12초간 정상 종료를 기다립니다. base는 `systemctl --user stop turtlebot-dashboard-base.service`로 service cgroup 전체에 `SIGINT`를 전달하므로 LiDAR 자식 프로세스도 `Ctrl+C`와 같은 순서로 종료됩니다. 시간 안에 끝나지 않은 dashboard tmux/nohup 세션만 제한적으로 강제 종료하며, 수동으로 실행한 ROS 프로세스는 종료하지 않고 검증 실패로 표시합니다.
 
 직접 SSH 터미널에서 실행한 기존 `ros2 launch`는 대시보드가 소유하지 않으므로 자동 종료하지 않습니다. 한 번 `Ctrl+C`로 종료한 뒤 대시보드 브링업으로 전환하세요.
 
