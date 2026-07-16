@@ -204,6 +204,8 @@ function bindElements() {
     "manualAngularSpeed",
     "manualStopButton",
     "sendGoalButton",
+    "resumeRouteButton",
+    "routeResumeStatus",
     "cancelGoalButton",
     "stopButton",
     "statusMode",
@@ -246,6 +248,7 @@ function bindActions() {
   els.saveSetupButton.addEventListener("click", saveSetup);
   els.applyInitialPoseButton.addEventListener("click", applyInitialPose);
   els.sendGoalButton.addEventListener("click", sendGoal);
+  els.resumeRouteButton.addEventListener("click", resumeRoute);
   els.goalModeButton.addEventListener("click", () => setWaypointMode(false));
   els.waypointModeButton.addEventListener("click", () => setWaypointMode(true));
   els.clearWaypointsButton.addEventListener("click", clearWaypoints);
@@ -664,6 +667,54 @@ function fillRuntime(runtime) {
   els.statusSafety.textContent = runtime.fallbackActive
     ? `LiDAR ${lidarState} · scale ${runtime.fallbackSpeedScale ?? "-"} · clearance ${runtime.lidarMinClearance ?? "-"} m · recovery ${runtime.fallbackRecoveryPhase ?? "none"} · ${lidarPointCount} pts · 임시 ${dynamicObstacleCount} · scan ${runtime.scanAgeMs ?? "-"} ms`
     : `LiDAR ${lidarState} · ${lidarPointCount} pts · 임시 ${dynamicObstacleCount}`;
+  updateRouteResumeUi(runtime);
+}
+
+function updateRouteResumeUi(runtime = state.data?.runtime || {}) {
+  const checkpoint = runtime.routeCheckpoint || {};
+  const route = Array.isArray(checkpoint.route) ? checkpoint.route : [];
+  const nextIndex = Math.max(0, Math.trunc(Number(checkpoint.nextIndex) || 0));
+  const nextWaypointNumber = Number(checkpoint.nextWaypointNumber);
+  const completed = Array.isArray(checkpoint.completedWaypointNumbers)
+    ? checkpoint.completedWaypointNumbers.map(Number).filter(Number.isFinite)
+    : [];
+  const navStatus = String(runtime.navStatus || "");
+  const activeRobot = state.data?.setup?.activeRobot || "";
+  const checkpointRobot = String(checkpoint.robotId || "");
+  const activelyDriving = [
+    "moving",
+    "accepted",
+    "sending_goal",
+    "sending_route",
+    "fallback_starting",
+    "fallback_moving",
+    "fallback_slow",
+    "fallback_replanned",
+    "fallback_lidar_coast",
+  ].includes(navStatus) || navStatus.startsWith("fallback_recovery_");
+  const available = Boolean(checkpoint.available)
+    && (!checkpointRobot || checkpointRobot === activeRobot)
+    && nextIndex < route.length
+    && Number.isInteger(nextWaypointNumber)
+    && nextWaypointNumber > 0;
+  els.resumeRouteButton.disabled = !available || activelyDriving;
+  els.resumeRouteButton.textContent = available
+    ? `이어서 주행 (#${nextWaypointNumber}부터)`
+    : "이어서 주행";
+  if (!available) {
+    els.routeResumeStatus.textContent = checkpoint.available && checkpointRobot !== activeRobot
+      ? "다른 로봇의 저장 경로"
+      : checkpoint.status === "completed"
+      ? "저장 경로 완료"
+      : "저장된 이어 주행 없음";
+    return;
+  }
+  const lastCompleted = completed.length ? completed[completed.length - 1] : null;
+  const prefix = lastCompleted ? `마지막 통과 #${lastCompleted}` : "통과 지점 없음";
+  const reason = checkpoint.status === "interrupted" && checkpoint.interruptionReason
+    ? ` · ${checkpoint.interruptionReason}`
+    : "";
+  els.routeResumeStatus.textContent = `${prefix} · 다음 #${nextWaypointNumber}${reason}`;
 }
 
 function updateCameraUi(runtime = state.data?.runtime || {}) {
@@ -681,13 +732,21 @@ function updateCameraUi(runtime = state.data?.runtime || {}) {
   els.cameraFpsBadge.classList.toggle("off", !enabled);
   els.cameraFrame.classList.toggle("camera-off", !enabled);
   els.cameraStamp.textContent = enabled ? runtime.lastCameraAt || "-" : "OFF";
-  if (!enabled && els.cameraFrame.dataset.cameraState !== "off") {
-    els.cameraFrame.dataset.cameraState = "off";
-    els.cameraFrame.src = `/api/camera/frame?t=${Date.now()}`;
-  }
-  if (enabled) {
-    els.cameraFrame.dataset.cameraState = "on";
-  }
+  updateCameraTransport();
+}
+
+function updateCameraTransport(force = false) {
+  const runtime = state.data?.runtime || {};
+  const enabled = state.cameraEnabled !== false;
+  const streamMode = runtime.cameraStream === "raw" ? "raw" : "compressed";
+  const transport = enabled ? (streamMode === "compressed" ? "mjpeg" : "raw") : "off";
+  if (!force && els.cameraFrame.dataset.cameraTransport === transport) return;
+
+  els.cameraFrame.dataset.cameraTransport = transport;
+  els.cameraFrame.dataset.cameraState = enabled ? "on" : "off";
+  els.cameraFrame.src = transport === "mjpeg"
+    ? `/api/camera/stream?t=${Date.now()}`
+    : `/api/camera/frame?t=${Date.now()}`;
 }
 
 function formatRuntimeGoal(runtime) {
@@ -742,7 +801,6 @@ async function toggleCamera() {
       state.data.runtime = { ...state.data.runtime, ...runtime };
     }
     updateCameraUi(runtime);
-    els.cameraFrame.src = `/api/camera/frame?t=${Date.now()}`;
     toast(enabled ? "카메라를 켰습니다." : "카메라를 껐습니다.");
   } catch (error) {
     toast(error.message);
@@ -762,7 +820,6 @@ async function setCameraStreamMode(mode) {
       state.data.runtime = { ...state.data.runtime, ...runtime };
     }
     updateCameraUi(runtime);
-    els.cameraFrame.src = `/api/camera/frame?t=${Date.now()}`;
     toast(mode === "raw" ? "Raw 카메라 스트림으로 전환했습니다." : "Compressed 카메라 스트림으로 전환했습니다.");
   } catch (error) {
     toast(error.message);
@@ -1592,9 +1649,15 @@ async function sendGoal() {
     return;
   }
   await stopManualDrive({ force: true });
-  const route = routeTargets();
+  const route = Array.isArray(plan.targets) && plan.targets.length
+    ? plan.targets
+    : routeTargets();
   if (!route.length) {
     toast("실행할 경로 지점이 없습니다.");
+    return;
+  }
+  if (repeat.enabled && route.length < 2) {
+    toast("반복 운행에는 도달 가능한 지점이 두 개 이상 필요합니다.");
     return;
   }
   const path = navigationPathPayload(route[route.length - 1]);
@@ -1625,6 +1688,64 @@ async function sendGoal() {
           repeat: repeatPayload,
         })
       : await postJson("/api/goal", { ...payload, path });
+  showResult(result);
+}
+
+async function resumeRoute() {
+  const runtime = state.data?.runtime || {};
+  const checkpoint = runtime.routeCheckpoint || {};
+  const activeRobot = state.data?.setup?.activeRobot || "";
+  if (checkpoint.robotId && checkpoint.robotId !== activeRobot) {
+    toast("현재 로봇과 저장 경로의 로봇이 다릅니다.");
+    return;
+  }
+  const savedRoute = Array.isArray(checkpoint.route) ? checkpoint.route : [];
+  const nextIndex = Math.max(0, Math.trunc(Number(checkpoint.nextIndex) || 0));
+  if (!checkpoint.available || nextIndex >= savedRoute.length) {
+    toast("이어갈 저장 경로가 없습니다.");
+    return;
+  }
+  const pose = runtime.pose;
+  if (!pose || !Number.isFinite(Number(pose.x)) || !Number.isFinite(Number(pose.y))) {
+    toast("현재 위치를 확인할 수 없어 이어서 주행할 수 없습니다.");
+    return;
+  }
+  const remainingRoute = savedRoute.slice(nextIndex).map((target, index) => ({
+    x: Number(target.x),
+    y: Number(target.y),
+    yaw: Number(target.yaw) || 0,
+    sourceIndex: Number.isInteger(Number(target.sourceIndex))
+      ? Number(target.sourceIndex)
+      : nextIndex + index,
+    final: Boolean(target.final),
+  }));
+  const plan = planRouteToGoal(remainingRoute);
+  if (!plan.ok) {
+    toast(`이어 주행 경로 불가: ${plan.status}`);
+    return;
+  }
+  const route = Array.isArray(plan.targets) ? plan.targets : [];
+  if (!route.length) {
+    toast("이어갈 수 있는 웨이포인트가 없습니다.");
+    return;
+  }
+  const path = navigationPathPayloadFromPoints(plan.points, route[route.length - 1]);
+  await stopManualDrive({ force: true });
+  await postJson("/api/cancel", {});
+  const result = await postJson("/api/route", {
+    poses: route,
+    path,
+    forceFallback: checkpoint.forceFallback !== false,
+    resume: true,
+    repeat: {
+      enabled: false,
+      start: 1,
+      end: route.length,
+      sourceStart: 1,
+      sourceEnd: route.length,
+      pauseSeconds: 5,
+    },
+  });
   showResult(result);
 }
 
@@ -1915,7 +2036,13 @@ function routeTargets() {
         ? requestedYaw
         : Math.atan2(target.y - previous.y, target.x - previous.x);
     previous = target;
-    return { x: Number(target.x), y: Number(target.y), yaw: normalizedYaw(yaw) };
+    return {
+      x: Number(target.x),
+      y: Number(target.y),
+      yaw: normalizedYaw(yaw),
+      sourceIndex: Number(target.sourceIndex),
+      final: Boolean(target.final),
+    };
   });
 }
 
@@ -2253,9 +2380,10 @@ function effectiveFootprint(setup) {
 }
 
 function plannerClearanceRadius(setup) {
+  const footprint = effectiveFootprint(setup);
   const configured = Number(setup.planner?.hardClearance);
   const clearance = Number.isFinite(configured) ? Math.max(0.05, configured) : 0.05;
-  return Math.max(0, clearance + (Number(setup.object?.inflation) || 0));
+  return Math.max(0, footprint.radius + clearance + (Number(setup.object?.inflation) || 0));
 }
 
 function nav2FootprintString(setup) {
@@ -2621,8 +2749,9 @@ function planPathToGoal() {
   });
 }
 
-function planRouteToGoal() {
-  const targets = routeTargets();
+function planRouteToGoal(targetsOverride = null) {
+  const resuming = Array.isArray(targetsOverride);
+  const targets = resuming ? targetsOverride : routeTargets();
   if (!state.data || targets.length === 0) {
     return setPlannedPath({ points: [], cells: [], status: "목표 없음", ok: false });
   }
@@ -2647,26 +2776,58 @@ function planRouteToGoal() {
 
   let totalDistance = 0;
   const routeCells = [];
+  const reachableTargets = [];
+  const skippedWaypointNumbers = [];
   for (let index = 0; index < targets.length; index += 1) {
     const target = targets[index];
     const goal = worldToGrid(target, setup);
-    const label = index === targets.length - 1 ? "목표" : `경유지 ${index + 1}`;
+    const sourceNumber = Number(target.sourceIndex) + 1;
+    const displayNumber = Number.isInteger(sourceNumber) && sourceNumber > 0
+      ? sourceNumber
+      : index + 1;
+    const label = target.final || index === targets.length - 1
+      ? "목표"
+      : `경유지 ${displayNumber}`;
+    let failure = "";
     if (!goal) {
-      return setPlannedPath({ points: [], cells: [], status: `${label}가 맵 밖`, ok: false });
+      failure = `${label}가 맵 밖`;
     }
-    const goalKey = cellKey(goal.x, goal.y);
-    if (blocked.has(goalKey)) {
-      return setPlannedPath({ points: [], cells: [], status: `${label}가 장애물 영역`, ok: false });
+    const goalKey = goal ? cellKey(goal.x, goal.y) : "";
+    if (!failure && blocked.has(goalKey)) {
+      failure = `${label}가 장애물 영역`;
     }
-    const result = runAStar(start, goal, blocked, metrics, soft);
-    if (!result.ok) {
-      return setPlannedPath({ points: [], cells: [], status: `${label}까지 경로 없음`, ok: false });
+    const result = failure ? null : runAStar(start, goal, blocked, metrics, soft);
+    if (!failure && !result.ok) {
+      failure = `${label}까지 경로 없음`;
     }
+    if (failure) {
+      if (index < targets.length - 1) {
+        skippedWaypointNumbers.push(
+          displayNumber,
+        );
+        continue;
+      }
+      return setPlannedPath({ points: [], cells: [], status: failure, ok: false });
+    }
+    const executableRouteIndex = reachableTargets.length;
     const segmentCells = routeCells.length ? result.cells.slice(1) : result.cells;
-    routeCells.push(...segmentCells.map((cell) => ({ ...cell, routeIndex: index })));
+    routeCells.push(
+      ...segmentCells.map((cell) => ({ ...cell, routeIndex: executableRouteIndex })),
+    );
     totalDistance += result.distance;
+    reachableTargets.push({ ...target });
     start = goal;
   }
+
+  const executableTargets = reachableTargets.map((target, index) => {
+    const next = reachableTargets[index + 1];
+    return {
+      ...target,
+      yaw: next
+        ? normalizedYaw(Math.atan2(next.y - target.y, next.x - target.x))
+        : target.yaw,
+    };
+  });
 
   const points = routeCells.map((cell) => ({
     ...gridToWorld(cell, setup),
@@ -2674,14 +2835,24 @@ function planRouteToGoal() {
     routeIndex: cell.routeIndex,
   }));
   const slowCellCount = points.filter((point) => point.slow).length;
-  const repeat = repeatRouteConfig(state.waypoints.length + 1);
-  const routeLabel = repeat.enabled
+  const repeat = resuming
+    ? { enabled: false }
+    : repeatRouteConfig(state.waypoints.length + 1);
+  const firstResumeNumber = Number(executableTargets[0]?.sourceIndex) + 1;
+  const routeLabel = resuming
+    ? `이어 주행 #${Number.isInteger(firstResumeNumber) ? firstResumeNumber : 1}부터`
+    : repeat.enabled
     ? `반복 #${repeat.start}~#${repeat.end}`
-    : `경유지 ${Math.max(0, targets.length - 1)}개`;
+    : `경유지 ${Math.max(0, executableTargets.length - 1)}개`;
+  const skippedLabel = skippedWaypointNumbers.length
+    ? ` · 건너뜀 #${skippedWaypointNumbers.join(", #")}`
+    : "";
   return setPlannedPath({
     points,
     cells: routeCells,
-    status: `OK · ${routeLabel} · ${routeCells.length} cells · 감속 ${slowCellCount} · ${round(totalDistance)} m`,
+    targets: executableTargets,
+    skippedWaypointNumbers,
+    status: `OK · ${routeLabel}${skippedLabel} · ${routeCells.length} cells · 감속 ${slowCellCount} · ${round(totalDistance)} m`,
     ok: true,
   });
 }
@@ -3587,9 +3758,25 @@ async function saveEditorMap() {
 function startCameraLoop() {
   const refresh = () => {
     if (!state.cameraEnabled) return;
+    const streamMode = state.data?.runtime?.cameraStream === "raw" ? "raw" : "compressed";
+    if (streamMode !== "raw") {
+      updateCameraTransport();
+      return;
+    }
     els.cameraFrame.dataset.cameraState = "on";
+    els.cameraFrame.dataset.cameraTransport = "raw";
     els.cameraFrame.src = `/api/camera/frame?t=${Date.now()}`;
   };
+  els.cameraFrame.addEventListener("error", () => {
+    if (
+      state.cameraEnabled &&
+      state.data?.runtime?.cameraStream !== "raw" &&
+      els.cameraFrame.dataset.cameraTransport === "mjpeg"
+    ) {
+      els.cameraFrame.dataset.cameraTransport = "";
+      window.setTimeout(() => updateCameraTransport(true), 500);
+    }
+  });
   refresh();
   setInterval(refresh, 180);
 }

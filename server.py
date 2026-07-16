@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-16.74"
+APP_VERSION = "2026-07-16.78"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -245,6 +245,20 @@ DEFAULT_STATE: Dict[str, Any] = {
         "routeRepeatStart": 1,
         "routeRepeatEnd": 1,
         "routeRepeatResumeAt": None,
+        "routeCheckpoint": {
+            "available": False,
+            "route": [],
+            "nextIndex": 0,
+            "nextWaypointNumber": None,
+            "completedWaypointNumbers": [],
+            "lastCompletedWaypointNumber": None,
+            "robotId": None,
+            "forceFallback": True,
+            "status": "empty",
+            "interruptionReason": None,
+            "resumedCount": 0,
+            "updatedAt": None,
+        },
         "robotPoses": {},
         "navStatus": "idle",
         "navMessage": "",
@@ -367,10 +381,91 @@ def normalized_robot_connection(connection: Any, fallback: Any = None) -> Dict[s
     return result
 
 
+def normalized_route_checkpoint(value: Any) -> Dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    route: list[Dict[str, Any]] = []
+    for index, raw_pose in enumerate(raw.get("route", []) if isinstance(raw.get("route"), list) else []):
+        if not isinstance(raw_pose, dict) or len(route) >= 20:
+            continue
+        try:
+            x = float(raw_pose.get("x"))
+            y = float(raw_pose.get("y"))
+            yaw = float(raw_pose.get("yaw", 0.0))
+            source_index_value = float(raw_pose.get("sourceIndex", index))
+        except (TypeError, ValueError):
+            continue
+        source_index = int(source_index_value)
+        if (
+            not all(math.isfinite(number) for number in (x, y, yaw, source_index_value))
+            or source_index_value != source_index
+            or not 0 <= source_index < 20
+        ):
+            continue
+        route.append(
+            {
+                "x": x,
+                "y": y,
+                "yaw": normalize_yaw(yaw),
+                "sourceIndex": source_index,
+                "final": bool(raw_pose.get("final", False)),
+            }
+        )
+
+    try:
+        next_index = int(float(raw.get("nextIndex", 0)))
+    except (TypeError, ValueError):
+        next_index = 0
+    next_index = max(0, min(next_index, len(route)))
+    completed: list[int] = []
+    raw_completed = raw.get("completedWaypointNumbers", [])
+    if isinstance(raw_completed, list):
+        for raw_number in raw_completed:
+            try:
+                number_value = float(raw_number)
+                number = int(number_value)
+            except (TypeError, ValueError):
+                continue
+            if number_value == number and 1 <= number <= 20 and number not in completed:
+                completed.append(number)
+    completed.sort()
+    available = bool(raw.get("available", bool(route))) and next_index < len(route)
+    next_waypoint_number = (
+        int(route[next_index]["sourceIndex"]) + 1 if available else None
+    )
+    try:
+        resumed_count = max(0, int(float(raw.get("resumedCount", 0))))
+    except (TypeError, ValueError):
+        resumed_count = 0
+    status = str(raw.get("status") or ("active" if available else "empty"))
+    if not route:
+        status = "empty"
+    elif not available and next_index >= len(route):
+        status = "completed"
+    return {
+        "available": available,
+        "route": route,
+        "nextIndex": next_index,
+        "nextWaypointNumber": next_waypoint_number,
+        "completedWaypointNumbers": completed,
+        "lastCompletedWaypointNumber": completed[-1] if completed else None,
+        "robotId": str(raw.get("robotId") or "") or None,
+        "forceFallback": bool(raw.get("forceFallback", True)),
+        "status": status,
+        "interruptionReason": raw.get("interruptionReason"),
+        "resumedCount": resumed_count,
+        "updatedAt": raw.get("updatedAt"),
+    }
+
+
 def fresh_runtime_state(setup: Dict[str, Any], previous_runtime: Any = None) -> Dict[str, Any]:
     """Discard stale sensor/navigation data while retaining local camera preferences."""
     previous = previous_runtime if isinstance(previous_runtime, dict) else {}
     runtime = json.loads(json.dumps(DEFAULT_STATE["runtime"]))
+    checkpoint = normalized_route_checkpoint(previous.get("routeCheckpoint"))
+    if checkpoint["available"]:
+        checkpoint["status"] = "interrupted"
+        checkpoint["interruptionReason"] = "dashboard_restarted"
+        checkpoint["updatedAt"] = now_iso()
     runtime.update(
         {
             "appVersion": APP_VERSION,
@@ -387,6 +482,7 @@ def fresh_runtime_state(setup: Dict[str, Any], previous_runtime: Any = None) -> 
             "cameraStream": normalized_camera_stream_mode(
                 previous.get("cameraStream", "compressed")
             ),
+            "routeCheckpoint": checkpoint,
         }
     )
     _ = setup
@@ -613,6 +709,25 @@ def effective_footprint_from_setup(setup: Dict[str, Any]) -> Dict[str, float]:
         "left": half_width + max(0.0, float(accessory.get("left", 0.0))) + margin,
         "right": half_width + max(0.0, float(accessory.get("right", 0.0))) + margin,
     }
+
+
+def planning_clearance_radius_from_setup(setup: Dict[str, Any]) -> float:
+    footprint = effective_footprint_from_setup(setup)
+    footprint_radius = math.hypot(
+        max(float(footprint["front"]), float(footprint["back"])),
+        max(float(footprint["left"]), float(footprint["right"])),
+    )
+    planner = setup.get("planner", {}) or {}
+    object_config = setup.get("object", {}) or {}
+    try:
+        hard_clearance = max(0.05, float(planner.get("hardClearance") or 0.05))
+    except (TypeError, ValueError):
+        hard_clearance = 0.05
+    try:
+        obstacle_clearance = max(0.0, float(object_config.get("inflation") or 0.0))
+    except (TypeError, ValueError):
+        obstacle_clearance = 0.0
+    return footprint_radius + hard_clearance + obstacle_clearance
 
 
 def robot_avoidance_obstacles(
@@ -2031,10 +2146,12 @@ def fallback_astar_cells(
     blocked: set[Tuple[int, int]],
     cols: int,
     rows: int,
+    soft: Optional[set[Tuple[int, int]]] = None,
 ) -> list[Tuple[int, int]]:
     if goal in blocked or not (0 <= start[0] < cols and 0 <= start[1] < rows):
         return []
     blocked = set(blocked)
+    soft = set(soft or ())
     blocked.discard(start)
     queue: list[Tuple[float, float, Tuple[int, int]]] = []
     heapq.heappush(queue, (math.hypot(goal[0] - start[0], goal[1] - start[1]), 0.0, start))
@@ -2069,7 +2186,8 @@ def fallback_astar_cells(
                 or (current[0], current[1] + delta_y) in blocked
             ):
                 continue
-            next_score = score + math.hypot(delta_x, delta_y)
+            soft_multiplier = 4.0 if next_cell in soft else 1.0
+            next_score = score + math.hypot(delta_x, delta_y) * soft_multiplier
             if next_score >= scores.get(next_cell, math.inf):
                 continue
             scores[next_cell] = next_score
@@ -2077,6 +2195,46 @@ def fallback_astar_cells(
             heuristic = math.hypot(goal[0] - next_cell[0], goal[1] - next_cell[1])
             heapq.heappush(queue, (next_score + heuristic, next_score, next_cell))
     return []
+
+
+def fallback_inflated_cells(
+    blocked: set[Tuple[int, int]], radius: float, metrics: Dict[str, Any]
+) -> set[Tuple[int, int]]:
+    cell_size = float(metrics["cellSize"])
+    radius = max(0.0, float(radius))
+    radius_cells = math.ceil(radius / cell_size)
+    inflated = set(blocked)
+    for cell_x, cell_y in blocked:
+        for offset_x in range(-radius_cells, radius_cells + 1):
+            for offset_y in range(-radius_cells, radius_cells + 1):
+                if math.hypot(offset_x, offset_y) * cell_size > radius:
+                    continue
+                next_cell = cell_x + offset_x, cell_y + offset_y
+                if 0 <= next_cell[0] < int(metrics["cols"]) and 0 <= next_cell[1] < int(metrics["rows"]):
+                    inflated.add(next_cell)
+    return inflated
+
+
+def fallback_route_path_ends(
+    path: list[Dict[str, Any]], route_length: int
+) -> Dict[int, int]:
+    ends: Dict[int, int] = {}
+    for index, point in enumerate(path):
+        marker = point.get("routeIndex")
+        if isinstance(marker, int) and 0 <= marker < route_length:
+            ends[marker] = index
+    return ends
+
+
+def fallback_next_route_index(
+    route_index: int, route_length: int, route_path_ends: Dict[int, int]
+) -> Optional[int]:
+    if route_index >= route_length - 1:
+        return None
+    if not route_path_ends:
+        return route_index + 1
+    candidates = sorted(index for index in route_path_ends if index > route_index)
+    return candidates[0] if candidates else None
 
 
 def fallback_replan_path(
@@ -2135,21 +2293,10 @@ def fallback_replan_path(
             for grid_y in range(min_cell[1], max_cell[1] + 1):
                 blocked.add((grid_x, grid_y))
 
-    planner = setup.get("planner", {}) or {}
-    object_config = setup.get("object", {}) or {}
-    clearance = max(0.05, float(planner.get("hardClearance") or 0.05)) + max(
-        0.0, float(object_config.get("inflation") or 0.0)
-    )
-    radius_cells = math.ceil(clearance / float(metrics["cellSize"]))
-    inflated = set(blocked)
-    for cell_x, cell_y in blocked:
-        for offset_x in range(-radius_cells, radius_cells + 1):
-            for offset_y in range(-radius_cells, radius_cells + 1):
-                if math.hypot(offset_x, offset_y) * float(metrics["cellSize"]) > clearance:
-                    continue
-                next_cell = cell_x + offset_x, cell_y + offset_y
-                if 0 <= next_cell[0] < int(metrics["cols"]) and 0 <= next_cell[1] < int(metrics["rows"]):
-                    inflated.add(next_cell)
+    clearance = planning_clearance_radius_from_setup(setup)
+    soft_distance = normalized_fallback_settings(setup)["softDistance"]
+    inflated = fallback_inflated_cells(blocked, clearance, metrics)
+    soft_inflated = fallback_inflated_cells(blocked, clearance + soft_distance, metrics)
 
     remaining_route = route[max(0, int(route_index)) :]
     if not remaining_route:
@@ -2162,12 +2309,29 @@ def fallback_replan_path(
         except (KeyError, TypeError, ValueError):
             return [], "route contains an invalid target"
         if target_cell is None:
-            return [], f"route target {marker + 1} is outside the map"
-        segment = fallback_astar_cells(current, target_cell, inflated, int(metrics["cols"]), int(metrics["rows"]))
+            if marker < len(route) - 1:
+                continue
+            return [], f"final route target {marker + 1} is outside the map"
+        segment = fallback_astar_cells(
+            current,
+            target_cell,
+            inflated,
+            int(metrics["cols"]),
+            int(metrics["rows"]),
+            soft_inflated,
+        )
         if not segment:
-            return [], f"no safe detour to route target {marker + 1}"
+            if marker < len(route) - 1:
+                continue
+            return [], f"no safe detour to final route target {marker + 1}"
         for cell in segment[1 if path else 0 :]:
-            path.append({**fallback_cell_to_world(cell, metrics), "slow": False, "routeIndex": marker})
+            path.append(
+                {
+                    **fallback_cell_to_world(cell, metrics),
+                    "slow": cell in soft_inflated,
+                    "routeIndex": marker,
+                }
+            )
         current = target_cell
     return path, ""
 
@@ -3381,6 +3545,7 @@ def format_diagnostics_report(
                 "goal": runtime.get("goal"),
                 "route": runtime.get("route"),
                 "routeIndex": runtime.get("routeIndex"),
+                "routeCheckpoint": runtime.get("routeCheckpoint"),
                 "cameraEnabled": runtime.get("cameraEnabled"),
                 "lastScanAt": runtime.get("lastScanAt"),
                 "lastPoseAt": runtime.get("lastPoseAt"),
@@ -3608,6 +3773,7 @@ class RunLogStore:
                 "navMessage": runtime.get("navMessage"),
                 "pose": runtime.get("pose"),
                 "goal": runtime.get("goal"),
+                "routeCheckpoint": runtime.get("routeCheckpoint"),
                 "fallbackRecoveryPhase": runtime.get("fallbackRecoveryPhase"),
                 "lastScanAt": runtime.get("lastScanAt"),
                 "lastOdomAt": runtime.get("lastOdomAt"),
@@ -3654,6 +3820,8 @@ class DashboardState:
         self.camera_bytes: Optional[bytes] = None
         self.camera_content_type = "image/svg+xml"
         self._camera_frame_times: deque[float] = deque(maxlen=60)
+        self._camera_condition = threading.Condition(self._lock)
+        self._camera_sequence = 0
         self.save()
 
     def _load(self) -> Dict[str, Any]:
@@ -3692,6 +3860,9 @@ class DashboardState:
                 "cameraEnabled": bool(persisted_runtime.get("cameraEnabled", True)),
                 "cameraStream": normalized_camera_stream_mode(
                     persisted_runtime.get("cameraStream", "compressed")
+                ),
+                "routeCheckpoint": normalized_route_checkpoint(
+                    persisted_runtime.get("routeCheckpoint")
                 ),
             }
             SETTINGS_PATH.write_text(
@@ -3773,12 +3944,105 @@ class DashboardState:
 
     def update_runtime(self, patch: Dict[str, Any]) -> None:
         status_event: Optional[Dict[str, Any]] = None
+        checkpoint_event: Optional[Dict[str, Any]] = None
+        checkpoint_changed = False
+        runtime_patch = dict(patch)
+        raw_skipped_indices = runtime_patch.pop("_routeCheckpointSkippedIndices", [])
+        checkpoint_skipped_indices: set[int] = set()
+        if isinstance(raw_skipped_indices, list):
+            for raw_index in raw_skipped_indices:
+                try:
+                    checkpoint_skipped_indices.add(int(raw_index))
+                except (TypeError, ValueError):
+                    continue
         with self._lock:
-            previous_status = self._state.get("runtime", {}).get("navStatus")
-            self._state["runtime"] = deep_merge(self._state["runtime"], patch)
+            previous_runtime = self._state.get("runtime", {})
+            previous_status = previous_runtime.get("navStatus")
+            previous_route = list(previous_runtime.get("route") or [])
+            try:
+                previous_route_index = int(previous_runtime.get("routeIndex") or 0)
+            except (TypeError, ValueError):
+                previous_route_index = 0
+            self._state["runtime"] = deep_merge(self._state["runtime"], runtime_patch)
             runtime = self._state["runtime"]
             current_status = runtime.get("navStatus")
-            if "navStatus" in patch and current_status != previous_status:
+            checkpoint = normalized_route_checkpoint(runtime.get("routeCheckpoint"))
+            if checkpoint["available"]:
+                try:
+                    current_route_index = int(runtime.get("routeIndex") or 0)
+                except (TypeError, ValueError):
+                    current_route_index = previous_route_index
+                if previous_route and current_route_index > previous_route_index:
+                    resolved_count = min(current_route_index, len(checkpoint["route"]))
+                    completed = set(checkpoint["completedWaypointNumbers"])
+                    for execution_index, pose in enumerate(
+                        checkpoint["route"][:resolved_count]
+                    ):
+                        if execution_index not in checkpoint_skipped_indices:
+                            completed.add(int(pose["sourceIndex"]) + 1)
+                    checkpoint["completedWaypointNumbers"] = sorted(completed)
+                    checkpoint["lastCompletedWaypointNumber"] = (
+                        checkpoint["completedWaypointNumbers"][-1]
+                        if checkpoint["completedWaypointNumbers"]
+                        else None
+                    )
+                    checkpoint["nextIndex"] = max(checkpoint["nextIndex"], resolved_count)
+                    checkpoint["nextWaypointNumber"] = (
+                        int(checkpoint["route"][checkpoint["nextIndex"]]["sourceIndex"]) + 1
+                        if checkpoint["nextIndex"] < len(checkpoint["route"])
+                        else None
+                    )
+                    checkpoint["status"] = "active"
+                    checkpoint["updatedAt"] = now_iso()
+                    checkpoint_changed = True
+                    checkpoint_event = {
+                        "status": checkpoint["status"],
+                        "nextIndex": checkpoint["nextIndex"],
+                        "nextWaypointNumber": checkpoint["nextWaypointNumber"],
+                        "completedWaypointNumbers": checkpoint["completedWaypointNumbers"],
+                    }
+                if current_status == "succeeded" and previous_route:
+                    completed = set(checkpoint["completedWaypointNumbers"])
+                    completed.update(
+                        int(pose["sourceIndex"]) + 1 for pose in checkpoint["route"]
+                    )
+                    checkpoint.update(
+                        {
+                            "available": False,
+                            "nextIndex": len(checkpoint["route"]),
+                            "nextWaypointNumber": None,
+                            "completedWaypointNumbers": sorted(completed),
+                            "lastCompletedWaypointNumber": max(completed) if completed else None,
+                            "status": "completed",
+                            "interruptionReason": None,
+                            "updatedAt": now_iso(),
+                        }
+                    )
+                    checkpoint_changed = True
+                    checkpoint_event = {
+                        "status": "completed",
+                        "nextIndex": checkpoint["nextIndex"],
+                        "nextWaypointNumber": None,
+                        "completedWaypointNumbers": checkpoint["completedWaypointNumbers"],
+                    }
+                elif "route" in runtime_patch and previous_route and not runtime.get("route"):
+                    checkpoint.update(
+                        {
+                            "status": "interrupted",
+                            "interruptionReason": str(current_status or "route_cleared"),
+                            "updatedAt": now_iso(),
+                        }
+                    )
+                    checkpoint_changed = True
+                    checkpoint_event = {
+                        "status": "interrupted",
+                        "nextIndex": checkpoint["nextIndex"],
+                        "nextWaypointNumber": checkpoint["nextWaypointNumber"],
+                        "completedWaypointNumbers": checkpoint["completedWaypointNumbers"],
+                        "reason": checkpoint["interruptionReason"],
+                    }
+            runtime["routeCheckpoint"] = checkpoint
+            if "navStatus" in runtime_patch and current_status != previous_status:
                 status_event = {
                     "status": current_status,
                     "previousStatus": previous_status,
@@ -3789,8 +4053,74 @@ class DashboardState:
                     "fallbackActive": runtime.get("fallbackActive"),
                     "recoveryPhase": runtime.get("fallbackRecoveryPhase"),
                 }
+        if checkpoint_changed:
+            self.save()
+            if checkpoint_event:
+                self.log_run_event("route_checkpoint_updated", **checkpoint_event)
         if status_event:
             self.log_run_event("nav_status", **status_event)
+
+    def begin_route_checkpoint(
+        self,
+        poses: list[Dict[str, Any]],
+        force_fallback: bool,
+        resume: bool = False,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            previous = normalized_route_checkpoint(
+                self._state.get("runtime", {}).get("routeCheckpoint")
+            )
+            seed = normalized_route_checkpoint(
+                {
+                    "available": True,
+                    "route": poses,
+                    "nextIndex": 0,
+                    "completedWaypointNumbers": (
+                        previous["completedWaypointNumbers"] if resume else []
+                    ),
+                    "robotId": self._state.get("setup", {}).get("activeRobot"),
+                    "forceFallback": force_fallback,
+                    "status": "active",
+                    "resumedCount": previous["resumedCount"] + (1 if resume else 0),
+                    "updatedAt": now_iso(),
+                }
+            )
+            self._state.setdefault("runtime", {})["routeCheckpoint"] = seed
+        self.save()
+        self.log_run_event(
+            "route_checkpoint_resumed" if resume else "route_checkpoint_started",
+            routeLength=len(seed["route"]),
+            nextWaypointNumber=seed["nextWaypointNumber"],
+            completedWaypointNumbers=seed["completedWaypointNumbers"],
+            forceFallback=seed["forceFallback"],
+            robotId=seed["robotId"],
+            resumedCount=seed["resumedCount"],
+        )
+        return seed
+
+    def interrupt_route_checkpoint(self, reason: str) -> Dict[str, Any]:
+        with self._lock:
+            checkpoint = normalized_route_checkpoint(
+                self._state.get("runtime", {}).get("routeCheckpoint")
+            )
+            if checkpoint["available"]:
+                checkpoint.update(
+                    {
+                        "status": "interrupted",
+                        "interruptionReason": str(reason or "interrupted"),
+                        "updatedAt": now_iso(),
+                    }
+                )
+                self._state.setdefault("runtime", {})["routeCheckpoint"] = checkpoint
+        self.save()
+        if checkpoint["available"]:
+            self.log_run_event(
+                "route_checkpoint_interrupted",
+                reason=checkpoint["interruptionReason"],
+                nextWaypointNumber=checkpoint["nextWaypointNumber"],
+                completedWaypointNumbers=checkpoint["completedWaypointNumbers"],
+            )
+        return checkpoint
 
     def update_robot_pose(self, robot_id: str, pose: Dict[str, Any]) -> None:
         """Store a non-active robot pose without replacing the active robot pose."""
@@ -3822,6 +4152,8 @@ class DashboardState:
                 self.camera_content_type = "image/svg+xml"
                 self._camera_frame_times.clear()
                 self._state["runtime"]["cameraFps"] = None
+            self._camera_sequence += 1
+            self._camera_condition.notify_all()
             return json.loads(json.dumps(self._state["runtime"]))
 
     def set_camera_stream_mode(self, mode: Any) -> Dict[str, Any]:
@@ -3834,6 +4166,8 @@ class DashboardState:
             runtime["lastCameraAt"] = None
             runtime["cameraFps"] = None
             self._camera_frame_times.clear()
+            self._camera_sequence += 1
+            self._camera_condition.notify_all()
             return json.loads(json.dumps(runtime))
 
     def camera_enabled(self) -> bool:
@@ -3863,6 +4197,8 @@ class DashboardState:
                 self._camera_frame_times.popleft()
             runtime["lastCameraAt"] = now_iso()
             runtime["cameraFps"] = camera_frame_rate(list(self._camera_frame_times))
+            self._camera_sequence += 1
+            self._camera_condition.notify_all()
 
     def get_camera(self) -> Tuple[bytes, str]:
         with self._lock:
@@ -3871,6 +4207,25 @@ class DashboardState:
             if self.camera_bytes:
                 return self.camera_bytes, self.camera_content_type
         return placeholder_svg(), "image/svg+xml"
+
+    def wait_for_camera_frame(
+        self, last_sequence: int, timeout: float = 1.0
+    ) -> Tuple[bytes, str, int, bool, str]:
+        with self._camera_condition:
+            self._camera_condition.wait_for(
+                lambda: self._camera_sequence != last_sequence,
+                timeout=max(0.0, float(timeout)),
+            )
+            runtime = self._state.get("runtime", {})
+            enabled = bool(runtime.get("cameraEnabled", True))
+            stream_mode = normalized_camera_stream_mode(runtime.get("cameraStream"))
+            if not enabled:
+                content, content_type = camera_disabled_svg(), "image/svg+xml"
+            elif self.camera_bytes:
+                content, content_type = self.camera_bytes, self.camera_content_type
+            else:
+                content, content_type = placeholder_svg(), "image/svg+xml"
+            return content, content_type, self._camera_sequence, enabled, stream_mode
 
 
 def placeholder_svg() -> bytes:
@@ -4152,6 +4507,7 @@ class NullRosBridge:
         repeat_path: Optional[list[Dict[str, Any]]] = None,
         force_fallback: bool = False,
         repeat: Optional[Dict[str, Any]] = None,
+        resume: bool = False,
     ) -> Dict[str, Any]:
         if not poses:
             return {"ok": False, "error": "Route is empty."}
@@ -4177,6 +4533,7 @@ class NullRosBridge:
             mode="offline-preview",
         )
         route = [dict(pose, stamp=now_iso()) for pose in poses]
+        self.state.begin_route_checkpoint(route, force_fallback, resume=resume)
         self.state.update_runtime(
             {
                 "route": route,
@@ -5563,11 +5920,9 @@ class RosBridge:
         footprint = effective_footprint_from_setup(fallback_setup)
         path_index = 0
         route_index = 0
-        route_path_ends: Dict[int, int] = {}
-        for index, point in enumerate(path):
-            marker = point.get("routeIndex")
-            if isinstance(marker, int) and 0 <= marker < len(route):
-                route_path_ends[marker] = index
+        route_path_ends = fallback_route_path_ends(path, len(route))
+        if route_path_ends:
+            route_index = min(route_path_ends)
         last_runtime_update = 0.0
         last_run_log = 0.0
         recovery: Dict[str, Any] = {
@@ -5579,12 +5934,7 @@ class RosBridge:
         last_safe_safety: Optional[Dict[str, Any]] = None
         recovery_started_at: Optional[float] = None
         last_replan_at = -math.inf
-        try:
-            dynamic_replan_clearance = max(
-                0.0, float((fallback_setup.get("planner") or {}).get("hardClearance", 0.0))
-            )
-        except (TypeError, ValueError):
-            dynamic_replan_clearance = 0.0
+        dynamic_replan_clearance = planning_clearance_radius_from_setup(fallback_setup)
         period = 0.1
         try:
             while not self._shutdown_event.is_set() and self._fallback_generation_current(generation):
@@ -5768,6 +6118,7 @@ class RosBridge:
                         if not self._fallback_generation_current(generation):
                             return
                         self._publish_cmd_vel(linear, angular)
+                        checkpoint_skipped_indices: list[int] = []
                         while route_index < len(route) - 1:
                             route_target = route[route_index]
                             route_distance = math.hypot(
@@ -5778,7 +6129,23 @@ class RosBridge:
                                 settings["lookahead"], settings["goalTolerance"] * 1.5
                             ):
                                 break
-                            route_index += 1
+                            next_route_index = fallback_next_route_index(
+                                route_index, len(route), route_path_ends
+                            )
+                            if next_route_index is None:
+                                break
+                            if next_route_index > route_index + 1:
+                                skipped_indices = list(
+                                    range(route_index + 1, next_route_index)
+                                )
+                                checkpoint_skipped_indices.extend(skipped_indices)
+                                self.state.log_run_event(
+                                    "fallback_waypoints_skipped",
+                                    skippedRouteIndices=skipped_indices,
+                                    nextRouteIndex=next_route_index,
+                                    reason="no_astar_path",
+                                )
+                            route_index = next_route_index
                         if cycle_started - last_run_log >= 0.5:
                             self.state.log_run_event(
                                 "fallback_lidar_coast",
@@ -5799,6 +6166,7 @@ class RosBridge:
                                 {
                                     "goal": route[route_index],
                                     "routeIndex": route_index,
+                                    "_routeCheckpointSkippedIndices": checkpoint_skipped_indices,
                                     "navStatus": "fallback_lidar_coast",
                                     "navMessage": (
                                         "LiDAR scan 끊김 · 마지막 안전 scan 기준 저속 주행 "
@@ -5902,11 +6270,23 @@ class RosBridge:
                         if replanned_path:
                             path = replanned_path
                             path_index = 0
-                            route_path_ends = {}
-                            for index, point in enumerate(path):
-                                marker = point.get("routeIndex")
-                                if isinstance(marker, int) and 0 <= marker < len(route):
-                                    route_path_ends[marker] = index
+                            route_path_ends = fallback_route_path_ends(path, len(route))
+                            replanned_indices = sorted(
+                                index for index in route_path_ends if index >= route_index
+                            )
+                            skipped_route_indices: list[int] = []
+                            if replanned_indices and replanned_indices[0] > route_index:
+                                next_route_index = replanned_indices[0]
+                                skipped_route_indices = list(
+                                    range(route_index, next_route_index)
+                                )
+                                route_index = next_route_index
+                                self.state.log_run_event(
+                                    "fallback_waypoints_skipped",
+                                    skippedRouteIndices=skipped_route_indices,
+                                    nextRouteIndex=route_index,
+                                    reason="replan_no_astar_path",
+                                )
                             recovery = {
                                 "phase": "none",
                                 "started": 0.0,
@@ -5927,12 +6307,20 @@ class RosBridge:
                                 {
                                     "goal": route[route_index],
                                     "routeIndex": route_index,
+                                    "_routeCheckpointSkippedIndices": skipped_route_indices,
                                     "navStatus": "fallback_replanned",
                                     "navMessage": (
                                         "LiDAR obstacle reached the active path; "
                                         "A* detour path replaced."
                                         if replan_reason == "dynamic_obstacle"
                                         else "LiDAR recovery persisted; A* detour path replaced."
+                                    ) + (
+                                        " Unreachable waypoint(s) skipped: "
+                                        + ", ".join(
+                                            str(index + 1) for index in skipped_route_indices
+                                        )
+                                        if skipped_route_indices
+                                        else ""
                                     ),
                                     "fallbackActive": True,
                                     "fallbackPathIndex": 0,
@@ -6039,6 +6427,7 @@ class RosBridge:
                     )
                     last_run_log = cycle_started
 
+                checkpoint_skipped_indices = []
                 while route_index < len(route) - 1:
                     route_target = route[route_index]
                     route_distance = math.hypot(
@@ -6047,7 +6436,23 @@ class RosBridge:
                     )
                     if route_distance > max(settings["lookahead"], settings["goalTolerance"] * 1.5):
                         break
-                    route_index += 1
+                    next_route_index = fallback_next_route_index(
+                        route_index, len(route), route_path_ends
+                    )
+                    if next_route_index is None:
+                        break
+                    if next_route_index > route_index + 1:
+                        skipped_indices = list(
+                            range(route_index + 1, next_route_index)
+                        )
+                        checkpoint_skipped_indices.extend(skipped_indices)
+                        self.state.log_run_event(
+                            "fallback_waypoints_skipped",
+                            skippedRouteIndices=skipped_indices,
+                            nextRouteIndex=next_route_index,
+                            reason="no_astar_path",
+                        )
+                    route_index = next_route_index
 
                 if cycle_started - last_runtime_update >= 0.2:
                     if not self._fallback_generation_current(generation):
@@ -6076,6 +6481,7 @@ class RosBridge:
                         {
                             "goal": route[route_index],
                             "routeIndex": route_index,
+                            "_routeCheckpointSkippedIndices": checkpoint_skipped_indices,
                             "navStatus": nav_status,
                             "navMessage": message,
                             "fallbackActive": True,
@@ -6638,6 +7044,7 @@ class RosBridge:
         repeat_path: Optional[list[Dict[str, Any]]] = None,
         force_fallback: bool = False,
         repeat: Optional[Dict[str, Any]] = None,
+        resume: bool = False,
     ) -> Dict[str, Any]:
         if self._is_fallback():
             return self._fallback.send_route(
@@ -6646,6 +7053,7 @@ class RosBridge:
                 repeat_path=repeat_path,
                 force_fallback=force_fallback,
                 repeat=repeat,
+                resume=resume,
             )
         if not poses:
             return {"ok": False, "error": "Route is empty."}
@@ -6668,6 +7076,7 @@ class RosBridge:
         self._prepare_autonomous_navigation()
         generation, repeat_config = self._begin_route_sequence(repeat_config, len(poses))
         route = [dict(pose, stamp=now_iso()) for pose in poses]
+        self.state.begin_route_checkpoint(route, force_fallback, resume=resume)
         self.state.update_runtime(
             {
                 "goal": route[0],
@@ -6695,6 +7104,7 @@ class RosBridge:
                 repeat_path=repeat_path,
             )
             if not fallback_result.get("ok"):
+                self.state.interrupt_route_checkpoint("fallback_unavailable")
                 self.state.update_runtime(
                     {
                         "navStatus": "fallback_unavailable",
@@ -6755,6 +7165,7 @@ class RosBridge:
                 "routeIndex": 0,
             }
         )
+        self.state.interrupt_route_checkpoint("route_unavailable")
         return {"ok": False, "error": message, "transport": "none"}
 
     def _on_route_goal_response(
@@ -8232,9 +8643,41 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def log_message(self, format: str, *args: Any) -> None:
-        if self.path.startswith("/api/camera/frame") or self.path.startswith("/api/events"):
+        if self.path.startswith("/api/camera/") or self.path.startswith("/api/events"):
             return
         super().log_message(format, *args)
+
+    def _camera_stream(self) -> None:
+        boundary = "turtlebot-camera-frame"
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            sequence = -1
+            while True:
+                content, content_type, next_sequence, enabled, stream_mode = (
+                    self.context.state.wait_for_camera_frame(sequence, timeout=1.0)
+                )
+                if not enabled or stream_mode != "compressed":
+                    break
+                if next_sequence == sequence:
+                    continue
+                sequence = next_sequence
+                header = (
+                    f"--{boundary}\r\n"
+                    f"Content-Type: {content_type}\r\n"
+                    f"Content-Length: {len(content)}\r\n\r\n"
+                ).encode("ascii")
+                self.wfile.write(header)
+                self.wfile.write(content)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+        finally:
+            self.close_connection = True
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -8274,6 +8717,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/events":
             self._events()
+            return
+        if parsed.path == "/api/camera/stream":
+            self._camera_stream()
             return
         if parsed.path == "/api/camera/frame":
             content, content_type = self.context.state.get_camera()
@@ -8524,6 +8970,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     repeat_path=repeat_path,
                     force_fallback=bool(body.get("forceFallback", False)),
                     repeat=repeat,
+                    resume=bool(body.get("resume", False)),
                 )
                 self._json(result)
                 return
@@ -8630,18 +9077,30 @@ def poses_differ(previous: Any, current: Any, tolerance: float = 1e-6) -> bool:
     )
 
 
-def parse_route(payload: Dict[str, Any]) -> list[Dict[str, float]]:
+def parse_route(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     raw_poses = payload.get("poses", [])
     if not isinstance(raw_poses, list) or not raw_poses:
         raise ValueError("Route poses are required.")
     if len(raw_poses) > 20:
         raise ValueError("Route can contain at most 20 poses.")
-    poses: list[Dict[str, float]] = []
-    for raw_pose in raw_poses:
+    poses: list[Dict[str, Any]] = []
+    for index, raw_pose in enumerate(raw_poses):
         if not isinstance(raw_pose, dict):
             raise ValueError("Each route pose must be an object.")
         x, y, yaw = parse_pose(raw_pose)
-        poses.append({"x": x, "y": y, "yaw": yaw})
+        source_index_value = finite_float(raw_pose.get("sourceIndex", index), "sourceIndex")
+        source_index = int(source_index_value)
+        if source_index_value != source_index or not 0 <= source_index < 20:
+            raise ValueError("sourceIndex must be an integer from 0 to 19.")
+        poses.append(
+            {
+                "x": x,
+                "y": y,
+                "yaw": yaw,
+                "sourceIndex": source_index,
+                "final": bool(raw_pose.get("final", False)),
+            }
+        )
     return poses
 
 

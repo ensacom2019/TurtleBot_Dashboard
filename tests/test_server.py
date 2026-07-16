@@ -1,4 +1,5 @@
 import inspect
+import json
 import math
 import shutil
 import subprocess
@@ -65,6 +66,39 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(server.camera_frame_rate([1.0]), None)
         self.assertEqual(server.camera_frame_rate([1.0, 1.2, 1.4, 1.6]), 5.0)
 
+    def test_compressed_camera_frame_notifies_stream_consumers(self) -> None:
+        state = object.__new__(server.DashboardState)
+        state._lock = server.threading.RLock()
+        state._camera_condition = server.threading.Condition(state._lock)
+        state._camera_sequence = 0
+        state._state = {
+            "runtime": {
+                "cameraEnabled": True,
+                "cameraStream": "compressed",
+                "cameraFps": None,
+            }
+        }
+        state.camera_bytes = None
+        state.camera_content_type = "image/svg+xml"
+        state._camera_frame_times = server.deque(maxlen=60)
+
+        state.set_camera(b"jpeg-frame", "image/jpeg", "compressed")
+        content, content_type, sequence, enabled, stream_mode = state.wait_for_camera_frame(
+            0, timeout=0.0
+        )
+
+        self.assertEqual(content, b"jpeg-frame")
+        self.assertEqual(content_type, "image/jpeg")
+        self.assertEqual(sequence, 1)
+        self.assertTrue(enabled)
+        self.assertEqual(stream_mode, "compressed")
+
+    def test_camera_stream_endpoint_uses_multipart_latest_frame_delivery(self) -> None:
+        source = inspect.getsource(server.DashboardHandler._camera_stream)
+        self.assertIn("multipart/x-mixed-replace", source)
+        self.assertIn("wait_for_camera_frame", source)
+        self.assertIn("next_sequence == sequence", source)
+
     def test_default_map_matches_saved_map_setup(self) -> None:
         setup = server.DEFAULT_STATE["setup"]
         self.assertEqual(setup["map"]["imageUrl"], "/data/Sprite-1.png")
@@ -84,6 +118,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(setup["fallbackNavigation"]["softDistance"], 0.10)
         self.assertEqual(setup["map"]["id"], "default-map")
         self.assertEqual(setup["mapLibrary"][0]["name"], "기본 맵")
+
+    def test_planning_clearance_includes_body_radius_and_extra_margin(self) -> None:
+        setup = server.DEFAULT_STATE["setup"]
+        expected_body_radius = math.hypot(0.09, 0.07)
+        self.assertAlmostEqual(
+            server.planning_clearance_radius_from_setup(setup),
+            expected_body_radius + 0.05,
+        )
+
+    def test_fallback_astar_prefers_clear_cells_over_soft_inflation(self) -> None:
+        soft = {(1, 1), (2, 1), (3, 1)}
+        path = server.fallback_astar_cells(
+            (0, 1), (4, 1), set(), cols=5, rows=3, soft=soft
+        )
+        self.assertTrue(path)
+        self.assertTrue(all(cell not in soft for cell in path))
 
     def test_default_robot_profile_only_contains_turtlebot_2(self) -> None:
         profiles = server.DEFAULT_STATE["setup"]["robotProfiles"]
@@ -410,6 +460,106 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(runtime["cameraEnabled"])
         self.assertEqual(runtime["cameraStream"], "raw")
 
+    def test_fresh_runtime_state_preserves_route_checkpoint_as_interrupted(self) -> None:
+        runtime = server.fresh_runtime_state(
+            server.DEFAULT_STATE["setup"],
+            {
+                "routeCheckpoint": {
+                    "available": True,
+                    "route": [
+                        {"x": 0.2, "y": 0.3, "yaw": 0.0, "sourceIndex": 1},
+                        {"x": 0.8, "y": 0.9, "yaw": 1.0, "sourceIndex": 2},
+                    ],
+                    "nextIndex": 1,
+                    "completedWaypointNumbers": [2],
+                    "forceFallback": True,
+                    "status": "active",
+                }
+            },
+        )
+        checkpoint = runtime["routeCheckpoint"]
+        self.assertTrue(checkpoint["available"])
+        self.assertEqual(checkpoint["status"], "interrupted")
+        self.assertEqual(checkpoint["interruptionReason"], "dashboard_restarted")
+        self.assertEqual(checkpoint["nextWaypointNumber"], 3)
+
+    def test_route_checkpoint_tracks_progress_and_survives_route_clear(self) -> None:
+        state = object.__new__(server.DashboardState)
+        state._lock = server.threading.RLock()
+        state._state = {
+            "runtime": json.loads(json.dumps(server.DEFAULT_STATE["runtime"]))
+        }
+        events = []
+        state.save = lambda: None
+        state.log_run_event = lambda event_type, **data: events.append((event_type, data))
+        route = [
+            {"x": 0.2, "y": 0.3, "yaw": 0.0, "sourceIndex": 0},
+            {"x": 0.8, "y": 0.9, "yaw": 1.0, "sourceIndex": 2},
+        ]
+
+        state.begin_route_checkpoint(route, True)
+        state.update_runtime(
+            {"route": route, "routeIndex": 0, "navStatus": "moving"}
+        )
+        state.update_runtime({"routeIndex": 1, "navStatus": "moving"})
+        state.update_runtime(
+            {"route": [], "routeIndex": 0, "navStatus": "stopped"}
+        )
+
+        checkpoint = state.snapshot()["runtime"]["routeCheckpoint"]
+        self.assertTrue(checkpoint["available"])
+        self.assertEqual(checkpoint["completedWaypointNumbers"], [1])
+        self.assertEqual(checkpoint["nextWaypointNumber"], 3)
+        self.assertEqual(checkpoint["status"], "interrupted")
+        self.assertTrue(any(event[0] == "route_checkpoint_updated" for event in events))
+
+    def test_route_checkpoint_does_not_mark_skipped_waypoint_as_passed(self) -> None:
+        state = object.__new__(server.DashboardState)
+        state._lock = server.threading.RLock()
+        state._state = {
+            "runtime": json.loads(json.dumps(server.DEFAULT_STATE["runtime"]))
+        }
+        state.save = lambda: None
+        state.log_run_event = lambda *_args, **_kwargs: None
+        route = [
+            {"x": 0.2, "y": 0.3, "yaw": 0.0, "sourceIndex": 0},
+            {"x": 0.8, "y": 0.9, "yaw": 1.0, "sourceIndex": 1},
+        ]
+        state.begin_route_checkpoint(route, True)
+        state.update_runtime(
+            {"route": route, "routeIndex": 0, "navStatus": "moving"}
+        )
+        state.update_runtime(
+            {
+                "routeIndex": 1,
+                "navStatus": "fallback_replanned",
+                "_routeCheckpointSkippedIndices": [0],
+            }
+        )
+
+        checkpoint = state.snapshot()["runtime"]["routeCheckpoint"]
+        self.assertEqual(checkpoint["completedWaypointNumbers"], [])
+        self.assertEqual(checkpoint["nextIndex"], 1)
+        self.assertEqual(checkpoint["nextWaypointNumber"], 2)
+        self.assertNotIn("_routeCheckpointSkippedIndices", state.snapshot()["runtime"])
+
+    def test_parse_route_preserves_source_waypoint_number(self) -> None:
+        route = server.parse_route(
+            {
+                "poses": [
+                    {
+                        "x": 0.3,
+                        "y": 0.4,
+                        "yaw": 0.5,
+                        "sourceIndex": 4,
+                        "final": False,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(route[0]["sourceIndex"], 4)
+        self.assertFalse(route[0]["final"])
+
     def test_dashboard_server_disallows_address_reuse(self) -> None:
         self.assertFalse(server.DashboardHttpServer.allow_reuse_address)
 
@@ -581,6 +731,63 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertGreater(len(path), 10)
         self.assertEqual(path[-1]["routeIndex"], 0)
+
+    def test_fallback_replan_skips_unreachable_intermediate_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            map_path = Path(temp_dir) / "empty.pgm"
+            map_path.write_bytes(b"P5\n10 10\n255\n" + bytes([255]) * 100)
+            setup = {
+                "map": {
+                    "imageUrl": str(map_path),
+                    "resolution": 0.1,
+                    "originX": 0.0,
+                    "originY": 0.0,
+                },
+                "robot": {"length": 0.02, "width": 0.02},
+                "planner": {"cellSize": 0.1, "hardClearance": 0.05},
+                "object": {"inflation": 0.0},
+            }
+            path, error = server.fallback_replan_path(
+                setup,
+                {"x": 0.05, "y": 0.05, "yaw": 0.0},
+                [{"x": 0.45, "y": 0.45}, {"x": 0.85, "y": 0.85}],
+                0,
+                [{"x": 0.45, "y": 0.45, "width": 0.1, "height": 0.1}],
+            )
+        self.assertEqual(error, "")
+        self.assertTrue(path)
+        self.assertNotIn(0, {point["routeIndex"] for point in path})
+        self.assertEqual(path[-1]["routeIndex"], 1)
+
+    def test_fallback_replan_keeps_unreachable_final_target_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            map_path = Path(temp_dir) / "empty.pgm"
+            map_path.write_bytes(b"P5\n10 10\n255\n" + bytes([255]) * 100)
+            setup = {
+                "map": {
+                    "imageUrl": str(map_path),
+                    "resolution": 0.1,
+                    "originX": 0.0,
+                    "originY": 0.0,
+                },
+                "robot": {"length": 0.02, "width": 0.02},
+                "planner": {"cellSize": 0.1, "hardClearance": 0.05},
+                "object": {"inflation": 0.0},
+            }
+            path, error = server.fallback_replan_path(
+                setup,
+                {"x": 0.05, "y": 0.05, "yaw": 0.0},
+                [{"x": 0.45, "y": 0.45}],
+                0,
+                [{"x": 0.45, "y": 0.45, "width": 0.1, "height": 0.1}],
+            )
+        self.assertEqual(path, [])
+        self.assertIn("final route target 1", error)
+
+    def test_fallback_next_route_index_skips_missing_path_markers(self) -> None:
+        self.assertEqual(server.fallback_next_route_index(0, 3, {0: 5, 2: 10}), 2)
+        self.assertIsNone(server.fallback_next_route_index(2, 3, {0: 5, 2: 10}))
+        self.assertEqual(server.fallback_next_route_index(0, 3, {}), 1)
 
     def test_fallback_path_detects_dynamic_obstacle_ahead(self) -> None:
         path = [
@@ -908,6 +1115,13 @@ class ServerHelpersTest(unittest.TestCase):
             def log_run_event(self, event_type, **data):
                 pass
 
+            def begin_route_checkpoint(self, poses, force_fallback, resume=False):
+                self.checkpoint = {
+                    "poses": poses,
+                    "forceFallback": force_fallback,
+                    "resume": resume,
+                }
+
             def snapshot(self):
                 return {"runtime": dict(self.runtime)}
 
@@ -964,6 +1178,13 @@ class ServerHelpersTest(unittest.TestCase):
 
             def log_run_event(self, event_type, **data):
                 pass
+
+            def begin_route_checkpoint(self, poses, force_fallback, resume=False):
+                self.checkpoint = {
+                    "poses": poses,
+                    "forceFallback": force_fallback,
+                    "resume": resume,
+                }
 
             def snapshot(self):
                 return {"runtime": dict(self.runtime)}
@@ -1232,6 +1453,13 @@ class ServerHelpersTest(unittest.TestCase):
 
             def log_run_event(self, _event_type, **_data):
                 pass
+
+            def begin_route_checkpoint(self, poses, force_fallback, resume=False):
+                self.checkpoint = {
+                    "poses": poses,
+                    "forceFallback": force_fallback,
+                    "resume": resume,
+                }
 
         bridge = object.__new__(server.RosBridge)
         bridge.state = FakeState()

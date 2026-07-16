@@ -61,7 +61,7 @@
                 <input id="gridCellSize" type="number" step="0.005" min="0.005" />
               </label>
               <label class="range-field">
-                분홍 금지 반경 m
+                본체 외곽 추가 금지 여유 m
                 <span class="range-pair">
                   <input id="plannerHardClearanceRange" type="range" step="0.01" min="0.05" max="0.40" />
                   <input id="plannerHardClearance" type="number" step="0.01" min="0.05" max="0.40" />
@@ -551,6 +551,8 @@
               A* 직접 주행 (Nav2 백업 사용 안 함)
             </label>
             <button id="sendGoalButton" class="primary wide">목표로 이동</button>
+            <button id="resumeRouteButton" class="secondary wide" type="button" disabled>이어서 주행</button>
+            <p id="routeResumeStatus" class="repeat-route-status">저장된 이어 주행 없음</p>
 
             <h2>상태</h2>
             <dl class="status-list">
