@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-16.72"
+APP_VERSION = "2026-07-16.73"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -4590,6 +4590,7 @@ class RosBridge:
         try:
             import rclpy
             from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped
+            from nav_msgs.msg import Odometry
             from rclpy.action import ActionClient
             from rclpy.context import Context
             from rclpy.node import Node

@@ -1,3 +1,4 @@
+import inspect
 import math
 import shutil
 import subprocess
@@ -22,6 +23,11 @@ def _bash_executable() -> str:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_ros_bridge_imports_odometry_for_odom_subscription(self) -> None:
+        source = inspect.getsource(server.RosBridge._init_ros)
+        self.assertIn("from nav_msgs.msg import Odometry", source)
+        self.assertIn("create_subscription(Odometry", source)
+
     def test_camera_stream_mode_defaults_to_compressed(self) -> None:
         self.assertEqual(server.normalized_camera_stream_mode("raw"), "raw")
         self.assertEqual(server.normalized_camera_stream_mode("Compressed"), "compressed")
