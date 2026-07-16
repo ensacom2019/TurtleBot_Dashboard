@@ -9,6 +9,18 @@ from types import SimpleNamespace
 import server
 
 
+def _bash_executable() -> str:
+    candidates: list[Path] = []
+    git_path = shutil.which("git")
+    if git_path:
+        git_root = Path(git_path).parent.parent
+        candidates.extend([git_root / "bin" / "bash.exe", git_root / "bin" / "bash"])
+    bash_path = shutil.which("bash")
+    if bash_path:
+        candidates.append(Path(bash_path))
+    return str(next((path for path in candidates if path.is_file()), ""))
+
+
 class ServerHelpersTest(unittest.TestCase):
     def test_camera_stream_mode_defaults_to_compressed(self) -> None:
         self.assertEqual(server.normalized_camera_stream_mode("raw"), "raw")
@@ -150,9 +162,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("start_detached tb3_base", script)
         self.assertNotIn('pkill -f "[m]ap_server', script)
         self.assertNotIn("pkill -f", script)
-        if shutil.which("bash"):
+        bash_path = _bash_executable()
+        if bash_path:
             syntax_check = subprocess.run(
-                ["bash", "-n"],
+                [bash_path, "-n"],
                 input=script.encode("utf-8"),
                 capture_output=True,
                 check=False,
@@ -202,9 +215,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("Nav2 processes still active (not force-killed)", script)
         self.assertIn("Camera processes still active (not force-killed)", script)
         self.assertIn("exit 22", script)
-        if shutil.which("bash"):
+        bash_path = _bash_executable()
+        if bash_path:
             syntax_check = subprocess.run(
-                ["bash", "-n"],
+                [bash_path, "-n"],
                 input=script.encode("utf-8"),
                 capture_output=True,
                 check=False,
@@ -248,6 +262,44 @@ class ServerHelpersTest(unittest.TestCase):
             routed_ip="192.168.35.229",
         )
         self.assertEqual(selected, "192.168.35.229")
+
+    def test_dashboard_access_advice_uses_detected_server_ip(self) -> None:
+        advice = server.dashboard_access_advice("192.168.20.4")
+        self.assertIn("http://localhost:8080", advice[0])
+        self.assertTrue(any("http://192.168.20.4:8080" in item for item in advice))
+        self.assertFalse(any("192.168.20.3" in item for item in advice))
+
+    def test_dashboard_access_advice_omits_lan_url_when_detection_is_empty(self) -> None:
+        self.assertEqual(
+            server.dashboard_access_advice(""),
+            ["서버 PC에서는 http://localhost:8080 으로 접속하세요."],
+        )
+
+    def test_ros_bridge_error_text_keeps_exception_type_and_message(self) -> None:
+        self.assertEqual(
+            server.ros_bridge_error_text(ImportError("librmw_fastrtps_cpp.so not found")),
+            "ImportError: librmw_fastrtps_cpp.so not found",
+        )
+        self.assertEqual(server.ros_bridge_error_text(RuntimeError()), "RuntimeError")
+
+    def test_diagnostics_report_includes_ros_bridge_error(self) -> None:
+        report = server.format_diagnostics_report(
+            {
+                "setup": {
+                    "network": {},
+                    "topics": {},
+                    "robotProfiles": {},
+                    "fallbackNavigation": {},
+                },
+                "runtime": {
+                    "mode": "offline-preview",
+                    "rosBridgeError": "ModuleNotFoundError: No module named 'rclpy'",
+                },
+            },
+            {"ok": False, "mode": "offline-preview", "checks": [], "advice": []},
+        )
+        self.assertIn("rosBridgeError: ModuleNotFoundError: No module named 'rclpy'", report)
+        self.assertIn('"rosBridgeError": "ModuleNotFoundError: No module named \'rclpy\'"', report)
 
     def test_same_subnet_hosts_stays_within_private_24(self) -> None:
         subnet, hosts = server.same_subnet_hosts("192.168.20.3")

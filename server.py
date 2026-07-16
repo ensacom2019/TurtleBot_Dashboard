@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-15.70"
+APP_VERSION = "2026-07-16.72"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -233,6 +233,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "runtime": {
         "rosConnected": False,
         "mode": "offline",
+        "rosBridgeError": None,
         "appVersion": APP_VERSION,
         "pose": {"x": 0.188, "y": 0.224, "yaw": 1.571, "source": "setup", "stamp": None},
         "goal": None,
@@ -1389,6 +1390,21 @@ def detect_server_ip(robot_ip: str = "") -> str:
     except Exception:
         pass
     return select_server_ip(target, local_ip_addresses(), routed_ip)
+
+
+def dashboard_access_advice(server_ip: str) -> list[str]:
+    advice = ["서버 PC에서는 http://localhost:8080 으로 접속하세요."]
+    detected = str(server_ip or "").strip()
+    if detected and not detected.startswith("127."):
+        advice.append(
+            f"같은 네트워크의 다른 기기에서는 http://{detected}:8080 으로 접속하세요."
+        )
+    return advice
+
+
+def ros_bridge_error_text(exc: BaseException) -> str:
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def same_subnet_hosts(address: str) -> tuple[Optional[ipaddress.IPv4Network], list[str]]:
@@ -3342,6 +3358,7 @@ def format_diagnostics_report(
         f"summary: {check.get('summary') or '-'}",
         f"navStatus: {runtime.get('navStatus') or '-'}",
         f"navMessage: {runtime.get('navMessage') or '-'}",
+        f"rosBridgeError: {runtime.get('rosBridgeError') or '-'}",
         "",
         "## Environment",
         f"ROS_DOMAIN_ID: {os.environ.get('ROS_DOMAIN_ID', '-')}",
@@ -3359,6 +3376,7 @@ def format_diagnostics_report(
             {
                 "rosConnected": runtime.get("rosConnected"),
                 "mode": runtime.get("mode"),
+                "rosBridgeError": runtime.get("rosBridgeError"),
                 "pose": runtime.get("pose"),
                 "goal": runtime.get("goal"),
                 "route": runtime.get("route"),
@@ -4048,8 +4066,9 @@ def image_msg_to_bmp(msg: Any) -> Optional[bytes]:
 
 
 class NullRosBridge:
-    def __init__(self, state: DashboardState) -> None:
+    def __init__(self, state: DashboardState, bridge_error: str = "") -> None:
         self.state = state
+        self.bridge_error = str(bridge_error or "ROS2 bridge initialization failed").strip()
         self._last_logged_manual_command: Optional[Tuple[float, float]] = None
         self._route_repeat_lock = threading.RLock()
         self._route_repeat_generation = 0
@@ -4062,8 +4081,20 @@ class NullRosBridge:
             {
                 "rosConnected": False,
                 "mode": "offline-preview",
-                "navMessage": "ROS2 rclpy not available; preview mode is active.",
+                "rosBridgeError": self.bridge_error,
+                "navMessage": f"ROS2 bridge unavailable: {self.bridge_error}",
                 "connection": base_connection_info(False),
+            }
+        )
+
+    def set_bridge_error(self, bridge_error: str) -> None:
+        self.bridge_error = str(bridge_error or "ROS2 bridge initialization failed").strip()
+        self.state.update_runtime(
+            {
+                "rosConnected": False,
+                "mode": "offline-preview",
+                "rosBridgeError": self.bridge_error,
+                "navMessage": f"ROS2 bridge unavailable: {self.bridge_error}",
             }
         )
 
@@ -4239,15 +4270,22 @@ class NullRosBridge:
         }
 
     def robot_check(self) -> Dict[str, Any]:
+        detected_server_ip = self.state.refresh_server_ip()
         snapshot = self.state.snapshot()
         network = snapshot["setup"].get("network", {})
+        bridge_error = str(
+            snapshot.get("runtime", {}).get("rosBridgeError") or self.bridge_error
+        )
         checks = [
             {
                 "id": "ros_bridge",
                 "label": "ROS2 브릿지",
                 "ok": False,
                 "level": "fail",
-                "detail": "현재 서버가 offline-preview 모드입니다. ROS2 Jazzy 환경에서 server.py를 실행해야 합니다.",
+                "detail": (
+                    "현재 서버가 offline-preview 모드입니다. "
+                    f"ROS2 브릿지 초기화 오류: {bridge_error}"
+                ),
             },
             {
                 "id": "domain_config",
@@ -4278,7 +4316,8 @@ class NullRosBridge:
             "checks": checks,
             "advice": [
                 "서버 PC에서 source /opt/ros/jazzy/setup.bash 후 ROS_DOMAIN_ID=1로 실행하세요.",
-                "브라우저는 http://192.168.20.3:8080 으로 접속하세요.",
+                f"ROS2 브릿지 예외 원문: {bridge_error}",
+                *dashboard_access_advice(detected_server_ip or network.get("serverIp", "")),
             ],
             "runtime": snapshot["runtime"],
             "connection": base_connection_info(False),
@@ -4642,7 +4681,7 @@ class RosBridge:
                 )
 
     def _activate_fallback(self, exc: Exception) -> None:
-        self._fallback_reason = str(exc)
+        self._fallback_reason = ros_bridge_error_text(exc)
         node = getattr(self, "node", None)
         if node is not None:
             try:
@@ -4658,7 +4697,9 @@ class RosBridge:
         self.ros_context = None
         self.node = None
         if not hasattr(self, "_fallback"):
-            self._fallback = NullRosBridge(self.state)
+            self._fallback = NullRosBridge(self.state, self._fallback_reason)
+        else:
+            self._fallback.set_bridge_error(self._fallback_reason)
 
     def _is_fallback(self) -> bool:
         return hasattr(self, "_fallback")
