@@ -28,6 +28,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("from nav_msgs.msg import Odometry", source)
         self.assertIn("create_subscription(Odometry", source)
 
+    def test_ros_workers_use_context_bound_executors_for_jazzy(self) -> None:
+        bridge_init = inspect.getsource(server.RosBridge._init_ros)
+        bridge_spin = inspect.getsource(server.RosBridge._spin_executor)
+        monitor_start = inspect.getsource(server.RobotPoseMonitor._start)
+        monitor_spin = inspect.getsource(server.RobotPoseMonitor._spin)
+
+        self.assertIn("SingleThreadedExecutor(context=self.ros_context)", bridge_init)
+        self.assertIn("SingleThreadedExecutor(context=self.context)", monitor_start)
+        self.assertIn("executor.spin()", bridge_spin)
+        self.assertIn("self.executor.spin()", monitor_spin)
+        self.assertNotIn("rclpy.spin", bridge_spin)
+        self.assertNotIn("rclpy.spin", monitor_spin)
+
+    def test_shutdown_ros_executor_stops_and_detaches_node(self) -> None:
+        calls = []
+
+        class FakeExecutor:
+            def shutdown(self, timeout_sec=None):
+                calls.append(("shutdown", timeout_sec))
+
+            def remove_node(self, node):
+                calls.append(("remove", node))
+
+        node = object()
+        server.shutdown_ros_executor(FakeExecutor(), node, timeout_sec=0.75)
+
+        self.assertEqual(calls, [("shutdown", 0.75), ("remove", node)])
+
     def test_camera_stream_mode_defaults_to_compressed(self) -> None:
         self.assertEqual(server.normalized_camera_stream_mode("raw"), "raw")
         self.assertEqual(server.normalized_camera_stream_mode("Compressed"), "compressed")

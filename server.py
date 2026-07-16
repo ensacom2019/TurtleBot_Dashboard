@@ -36,7 +36,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-16.73"
+APP_VERSION = "2026-07-16.74"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -4536,6 +4536,20 @@ class NullRosBridge:
         )
 
 
+def shutdown_ros_executor(executor: Any, node: Any, timeout_sec: float = 1.0) -> None:
+    if executor is None:
+        return
+    try:
+        executor.shutdown(timeout_sec=timeout_sec)
+    except Exception:
+        pass
+    if node is not None:
+        try:
+            executor.remove_node(node)
+        except Exception:
+            pass
+
+
 class RosBridge:
     def __init__(self, state: DashboardState) -> None:
         self.state = state
@@ -4543,6 +4557,7 @@ class RosBridge:
         self.topics = self.setup["topics"]
         self.node = None
         self.ros_context = None
+        self.ros_executor = None
         self.goal_handle = None
         self.route_goal_handle = None
         self._last_odom_pose: Optional[Tuple[float, float, float]] = None
@@ -4593,6 +4608,7 @@ class RosBridge:
             from nav_msgs.msg import Odometry
             from rclpy.action import ActionClient
             from rclpy.context import Context
+            from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
             from rclpy.qos import qos_profile_sensor_data
             from sensor_msgs.msg import CompressedImage, Image, LaserScan
@@ -4625,6 +4641,8 @@ class RosBridge:
             pass
 
         self.node = DashboardNode("turtlebot_web_dashboard", context=self.ros_context)
+        self.ros_executor = SingleThreadedExecutor(context=self.ros_context)
+        self.ros_executor.add_node(self.node)
         qos = 10
         self.initial_pose_pub = self.node.create_publisher(
             PoseWithCovarianceStamped, self.topics["initialPose"], qos
@@ -4668,13 +4686,15 @@ class RosBridge:
                 **self._cmd_vel_clock_status(),
             }
         )
-        self._spin_thread = threading.Thread(target=self._spin_node, args=(self.node,), daemon=True)
+        self._spin_thread = threading.Thread(
+            target=self._spin_executor, args=(self.ros_executor,), daemon=True
+        )
         self._spin_thread.start()
         self._start_manual_watchdog()
 
-    def _spin_node(self, node: Any) -> None:
+    def _spin_executor(self, executor: Any) -> None:
         try:
-            self.rclpy.spin(node, context=self.ros_context)
+            executor.spin()
         except Exception as exc:
             if not self._shutdown_event.is_set():
                 self.state.update_runtime(
@@ -4684,6 +4704,8 @@ class RosBridge:
     def _activate_fallback(self, exc: Exception) -> None:
         self._fallback_reason = ros_bridge_error_text(exc)
         node = getattr(self, "node", None)
+        executor = getattr(self, "ros_executor", None)
+        shutdown_ros_executor(executor, node)
         if node is not None:
             try:
                 node.destroy_node()
@@ -4696,6 +4718,7 @@ class RosBridge:
             except Exception:
                 pass
         self.ros_context = None
+        self.ros_executor = None
         self.node = None
         if not hasattr(self, "_fallback"):
             self._fallback = NullRosBridge(self.state, self._fallback_reason)
@@ -4714,20 +4737,22 @@ class RosBridge:
         except Exception:
             pass
         old_node = self.node
+        old_executor = self.ros_executor
         self.goal_handle = None
         self.route_goal_handle = None
         fallback = getattr(self, "_fallback", None)
         if fallback is not None:
             fallback.shutdown()
             del self._fallback
+        shutdown_ros_executor(old_executor, old_node)
+        if self._spin_thread and self._spin_thread.is_alive():
+            self._spin_thread.join(timeout=1.0)
         with self._publisher_lock:
             try:
                 if old_node is not None:
                     old_node.destroy_node()
             except Exception:
                 pass
-        if self._spin_thread and self._spin_thread.is_alive():
-            self._spin_thread.join(timeout=1.0)
 
         old_context = self.ros_context
         if old_context is not None:
@@ -4736,6 +4761,8 @@ class RosBridge:
             except Exception:
                 pass
         self.ros_context = None
+        self.ros_executor = None
+        self._spin_thread = None
 
         self.setup = next_setup
         self.topics = self.setup["topics"]
@@ -7604,6 +7631,9 @@ class RosBridge:
             self._manual_watchdog_thread.join(timeout=1.5)
         if self._fallback_nav_thread and self._fallback_nav_thread.is_alive():
             self._fallback_nav_thread.join(timeout=1.5)
+        shutdown_ros_executor(self.ros_executor, self.node)
+        if self._spin_thread and self._spin_thread.is_alive():
+            self._spin_thread.join(timeout=1.5)
         with self._publisher_lock:
             try:
                 if self.node is not None:
@@ -7615,8 +7645,7 @@ class RosBridge:
                 self.ros_context.try_shutdown()
         except Exception:
             pass
-        if self._spin_thread and self._spin_thread.is_alive():
-            self._spin_thread.join(timeout=1.5)
+        self.ros_executor = None
 
     def _cmd_vel_type_label(self) -> str:
         return getattr(self, "cmd_vel_msg_type", "geometry_msgs/msg/Twist").rsplit("/", 1)[-1]
@@ -8062,6 +8091,7 @@ class RobotPoseMonitor:
         self.profile = profile
         self.node = None
         self.context = None
+        self.executor = None
         self.rclpy = None
         self.thread: Optional[threading.Thread] = None
         self._stopped = threading.Event()
@@ -8074,6 +8104,7 @@ class RobotPoseMonitor:
             from geometry_msgs.msg import PoseWithCovarianceStamped
             from nav_msgs.msg import Odometry
             from rclpy.context import Context
+            from rclpy.executors import SingleThreadedExecutor
             from rclpy.node import Node
 
             connection = self.profile.get("connection") if isinstance(self.profile.get("connection"), dict) else {}
@@ -8082,6 +8113,8 @@ class RobotPoseMonitor:
             self.context = Context()
             self.context.init(args=None, initialize_logging=False, domain_id=domain_id)
             self.node = Node(f"turtlebot_pose_{self.robot_id}", context=self.context)
+            self.executor = SingleThreadedExecutor(context=self.context)
+            self.executor.add_node(self.node)
             topics = self.profile.get("topics") if isinstance(self.profile.get("topics"), dict) else {}
             self.node.create_subscription(PoseWithCovarianceStamped, topics.get("pose", "/amcl_pose"), self._on_amcl, 10)
             self.thread = threading.Thread(target=self._spin, daemon=True, name=f"pose-{self.robot_id}")
@@ -8094,7 +8127,7 @@ class RobotPoseMonitor:
 
     def _spin(self) -> None:
         try:
-            self.rclpy.spin(self.node, context=self.context)
+            self.executor.spin()
         except Exception as exc:
             if not self._stopped.is_set():
                 self.state.update_robot_pose(
@@ -8124,6 +8157,9 @@ class RobotPoseMonitor:
 
     def shutdown(self) -> None:
         self._stopped.set()
+        shutdown_ros_executor(self.executor, self.node)
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
         try:
             if self.node is not None:
                 self.node.destroy_node()
@@ -8134,8 +8170,7 @@ class RobotPoseMonitor:
                 self.context.try_shutdown()
         except Exception:
             pass
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
+        self.executor = None
 
 
 class RobotPoseMonitorManager:
