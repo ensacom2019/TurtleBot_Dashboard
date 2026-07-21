@@ -100,7 +100,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(enabled)
         self.assertEqual(stream_mode, "compressed")
 
-    def test_camera_buffer_delivers_burst_frames_in_order(self) -> None:
+    def test_camera_buffer_prefers_latest_frame_over_queued_frames(self) -> None:
         state = object.__new__(server.DashboardState)
         state._lock = server.threading.RLock()
         state._camera_condition = server.threading.Condition(state._lock)
@@ -128,7 +128,7 @@ class ServerHelpersTest(unittest.TestCase):
         third = state.wait_for_camera_frame(2, timeout=0.0)
 
         self.assertEqual((first[0], first[2]), (b"frame-2", 3))
-        self.assertEqual((second[0], second[2]), (b"frame-1", 2))
+        self.assertEqual((second[0], second[2]), (b"frame-2", 3))
         self.assertEqual((third[0], third[2]), (b"frame-2", 3))
 
     def test_camera_stream_endpoint_uses_multipart_latest_frame_delivery(self) -> None:

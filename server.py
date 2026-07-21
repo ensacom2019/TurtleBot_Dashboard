@@ -4503,14 +4503,11 @@ class DashboardState:
                 content, content_type = camera_disabled_svg(), "image/svg+xml"
                 sequence = self._camera_sequence
             elif self._camera_frames:
-                if last_sequence < 0:
-                    sequence, content, content_type = self._camera_frames[-1]
-                else:
-                    frame = next(
-                        (item for item in self._camera_frames if item[0] > last_sequence),
-                        self._camera_frames[-1],
-                    )
-                    sequence, content, content_type = frame
+                # A camera preview prioritizes freshness over completeness.  If the
+                # producer outruns the MJPEG client, sending queued older frames
+                # would make the display increasingly stale; skip directly to the
+                # newest frame instead.
+                sequence, content, content_type = self._camera_frames[-1]
             elif self.camera_bytes:
                 content, content_type = self.camera_bytes, self.camera_content_type
                 sequence = self._camera_sequence
