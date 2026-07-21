@@ -305,7 +305,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(setup["map"]["imageUrl"], "/data/Sprite-1.png")
         self.assertEqual((setup["map"]["widthPixels"], setup["map"]["heightPixels"]), (1800, 1800))
         self.assertEqual(setup["initialPose"], {"x": 0.188, "y": 0.224, "yaw": 1.571})
-        self.assertEqual(setup["robot"], {"length": 0.18, "width": 0.14, "radius": 0.114})
+        self.assertEqual(setup["robot"], {"length": 0.18, "width": 0.14})
         self.assertEqual(len(setup["obstacles"]), 2)
         self.assertEqual(
             [(item["width"], item["height"]) for item in setup["obstacles"]],
@@ -320,13 +320,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(setup["map"]["id"], "default-map")
         self.assertEqual(setup["mapLibrary"][0]["name"], "기본 맵")
 
-    def test_planning_clearance_includes_body_radius_and_extra_margin(self) -> None:
+    def test_planning_clearance_uses_rectangular_body_extents_and_margin(self) -> None:
         setup = server.DEFAULT_STATE["setup"]
-        expected_body_radius = math.hypot(0.09, 0.07)
-        self.assertAlmostEqual(
-            server.planning_clearance_radius_from_setup(setup),
-            expected_body_radius + 0.05,
-        )
+        clearance_x, clearance_y = server.planning_clearance_extents_from_setup(setup)
+        self.assertAlmostEqual(clearance_x, 0.14)
+        self.assertAlmostEqual(clearance_y, 0.12)
 
     def test_fallback_astar_prefers_clear_cells_over_soft_inflation(self) -> None:
         soft = {(1, 1), (2, 1), (3, 1)}
@@ -399,7 +397,7 @@ class ServerHelpersTest(unittest.TestCase):
             server.DEFAULT_STATE, {"setup": {"robot": {"length": 0.25, "width": 0.15, "radius": 0.146}}}
         )
         normalized = server.normalize_robot_profiles_state(state)
-        self.assertEqual(normalized["setup"]["robot"], {"length": 0.18, "width": 0.14, "radius": 0.114})
+        self.assertEqual(normalized["setup"]["robot"], {"length": 0.18, "width": 0.14})
 
     def test_map_editor_dimensions_require_whole_centimeters(self) -> None:
         self.assertEqual(
@@ -982,6 +980,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertGreater(len(path), 10)
         self.assertEqual(path[-1]["routeIndex"], 0)
+
+    def test_fallback_replan_uses_body_box_not_circumscribed_circle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            map_path = Path(temp_dir) / "bottom_wall.pgm"
+            width = height = 100
+            pixels = bytearray([255]) * (width * height)
+            pixels[(height - 1) * width : height * width] = bytes([0]) * width
+            map_path.write_bytes(
+                f"P5\n{width} {height}\n255\n".encode("ascii") + bytes(pixels)
+            )
+            setup = {
+                "map": {
+                    "imageUrl": str(map_path),
+                    "resolution": 0.01,
+                    "originX": 0.0,
+                    "originY": 0.0,
+                },
+                "robot": {"length": 0.18, "width": 0.14},
+                "planner": {"cellSize": 0.02, "hardClearance": 0.05},
+                "object": {"inflation": 0.0},
+            }
+            path, error = server.fallback_replan_path(
+                setup,
+                {"x": 0.45, "y": 0.30, "yaw": 0.0},
+                [{"x": 0.45, "y": 0.178}],
+                0,
+                [],
+            )
+        self.assertEqual(error, "")
+        self.assertTrue(path)
 
     def test_fallback_replan_skips_unreachable_intermediate_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

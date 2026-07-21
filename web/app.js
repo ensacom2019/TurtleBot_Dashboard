@@ -107,7 +107,6 @@ function bindElements() {
     "initialYaw",
     "robotLength",
     "robotWidth",
-    "robotRadius",
     "accessoryFront",
     "accessoryBack",
     "accessoryLeft",
@@ -528,7 +527,6 @@ function fillSetupForm(setup) {
   setInputIfIdle(els.initialYaw, setup.initialPose.yaw);
   setInputIfIdle(els.robotLength, setup.robot.length);
   setInputIfIdle(els.robotWidth, setup.robot.width);
-  setInputIfIdle(els.robotRadius, setup.robot.radius);
   setInputIfIdle(els.accessoryFront, setup.accessory?.front ?? 0);
   setInputIfIdle(els.accessoryBack, setup.accessory?.back ?? 0);
   setInputIfIdle(els.accessoryLeft, setup.accessory?.left ?? 0);
@@ -2264,7 +2262,6 @@ function currentSetup() {
     robot: {
       length: Math.max(0.01, numberValue(els.robotLength)),
       width: Math.max(0.01, numberValue(els.robotWidth)),
-      radius: Math.max(0.01, numberValue(els.robotRadius)),
     },
     accessory: {
       front: Math.max(0, numberValue(els.accessoryFront)),
@@ -2474,7 +2471,6 @@ function effectiveFootprint(setup) {
     right,
     length: front + back,
     width: left + right,
-    radius: Math.hypot(Math.max(front, back), Math.max(left, right)),
     points: [
       [front, left],
       [front, -right],
@@ -2484,14 +2480,19 @@ function effectiveFootprint(setup) {
   };
 }
 
-function configuredClearanceRadius(setup) {
+function configuredClearanceDistance(setup) {
   const configured = Number(setup.planner?.hardClearance);
   const clearance = Number.isFinite(configured) ? Math.max(0.05, configured) : 0.05;
   return Math.max(0, clearance + (Number(setup.object?.inflation) || 0));
 }
 
-function plannerClearanceRadius(setup) {
-  return Math.max(0, effectiveFootprint(setup).radius + configuredClearanceRadius(setup));
+function plannerClearanceExtents(setup, extraDistance = 0) {
+  const footprint = effectiveFootprint(setup);
+  const extra = Math.max(0, configuredClearanceDistance(setup) + Number(extraDistance || 0));
+  return {
+    x: Math.max(footprint.front, footprint.back) + extra,
+    y: Math.max(footprint.left, footprint.right) + extra,
+  };
 }
 
 function nav2FootprintString(setup) {
@@ -2786,20 +2787,22 @@ function obstacleCellsFor(obstacles, setup) {
   return keys;
 }
 
-function inflatedCellSetForRadius(setup, radius) {
+function inflatedCellSetForExtents(setup, extents) {
   const metrics = mapMetrics(setup);
   const blocked = blockedCellSet(setup);
   const inflated = new Set(blocked);
-  const normalizedRadius = Math.max(0, Number(radius) || 0);
-  const radiusCells = Math.ceil(normalizedRadius / metrics.cellSize);
+  const clearanceX = Math.max(0, Number(extents?.x) || 0);
+  const clearanceY = Math.max(0, Number(extents?.y) || 0);
+  const xCells = Math.ceil(clearanceX / metrics.cellSize);
+  const yCells = Math.ceil(clearanceY / metrics.cellSize);
   for (const key of blocked) {
     const cell = parseCellKey(key);
-    for (let dx = -radiusCells; dx <= radiusCells; dx += 1) {
-      for (let dy = -radiusCells; dy <= radiusCells; dy += 1) {
+    for (let dx = -xCells; dx <= xCells; dx += 1) {
+      for (let dy = -yCells; dy <= yCells; dy += 1) {
         const x = cell.x + dx;
         const y = cell.y + dy;
         if (x < 0 || y < 0 || x >= metrics.cols || y >= metrics.rows) continue;
-        if (Math.hypot(dx, dy) * metrics.cellSize <= normalizedRadius) {
+        if (Math.abs(dx) * metrics.cellSize <= clearanceX && Math.abs(dy) * metrics.cellSize <= clearanceY) {
           inflated.add(cellKey(x, y));
         }
       }
@@ -2809,10 +2812,7 @@ function inflatedCellSetForRadius(setup, radius) {
 }
 
 function inflatedCellSet(setup, extraRadius = 0) {
-  return inflatedCellSetForRadius(
-    setup,
-    plannerClearanceRadius(setup) + Math.max(0, Number(extraRadius) || 0),
-  );
+  return inflatedCellSetForExtents(setup, plannerClearanceExtents(setup, extraRadius));
 }
 
 function softInflatedCellSet(setup) {
@@ -2822,13 +2822,13 @@ function softInflatedCellSet(setup) {
 // Keep the overlay tied to the configured margins while collision planning also
 // accounts for the robot footprint internally.
 function displayedHardInflatedCellSet(setup) {
-  return inflatedCellSetForRadius(setup, configuredClearanceRadius(setup));
+  return inflatedCellSetForExtents(setup, plannerClearanceExtents(setup));
 }
 
 function displayedSoftInflatedCellSet(setup) {
-  return inflatedCellSetForRadius(
+  return inflatedCellSetForExtents(
     setup,
-    configuredClearanceRadius(setup) + (setup.fallbackNavigation?.softDistance ?? 0.10),
+    plannerClearanceExtents(setup, setup.fallbackNavigation?.softDistance ?? 0.10),
   );
 }
 
@@ -3217,7 +3217,6 @@ function setupInputs() {
     els.initialYaw,
     els.robotLength,
     els.robotWidth,
-    els.robotRadius,
     els.accessoryFront,
     els.accessoryBack,
     els.accessoryLeft,
@@ -3383,7 +3382,6 @@ function updateSetupFromPointer(world, point) {
     const width = setup.robot.width + (currentLocal.y - startLocal.y) * widthSign * 2;
     setNumber(els.robotLength, Math.max(0.05, length));
     setNumber(els.robotWidth, Math.max(0.05, width));
-    setNumber(els.robotRadius, Math.hypot(numberValue(els.robotLength), numberValue(els.robotWidth)) / 2);
   }
 
   if (tool === "accessory") {

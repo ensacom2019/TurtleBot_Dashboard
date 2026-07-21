@@ -37,7 +37,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-21.84"
+APP_VERSION = "2026-07-21.85"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -75,7 +75,6 @@ TWIST_TYPE = "geometry_msgs/msg/Twist"
 TWIST_STAMPED_TYPE = "geometry_msgs/msg/TwistStamped"
 DEFAULT_TURTLEBOT_LENGTH = 0.18
 DEFAULT_TURTLEBOT_WIDTH = 0.14
-DEFAULT_TURTLEBOT_RADIUS = 0.114
 CAMERA_FPS_WINDOW_SECONDS = 5.0
 CAMERA_FPS_MIN_WINDOW_SECONDS = 1.0
 CAMERA_FPS_UPDATE_SECONDS = 0.5
@@ -179,7 +178,6 @@ DEFAULT_STATE: Dict[str, Any] = {
         "robot": {
             "length": DEFAULT_TURTLEBOT_LENGTH,
             "width": DEFAULT_TURTLEBOT_WIDTH,
-            "radius": DEFAULT_TURTLEBOT_RADIUS,
         },
         "accessory": {"front": 0.0, "back": 0.0, "left": 0.0, "right": 0.0, "height": 0.0},
         "safety": {"margin": 0.0},
@@ -548,8 +546,9 @@ def normalize_robot_profiles_state(state: Dict[str, Any]) -> Dict[str, Any]:
         setup["robot"] = {
             "length": DEFAULT_TURTLEBOT_LENGTH,
             "width": DEFAULT_TURTLEBOT_WIDTH,
-            "radius": DEFAULT_TURTLEBOT_RADIUS,
         }
+    else:
+        setup["robot"] = normalized_robot_body(robot)
     active_robot = str(setup.get("activeRobot") or "tb3_2")
     if active_robot not in profiles:
         active_robot = "tb3_2"
@@ -732,12 +731,16 @@ def effective_footprint_from_setup(setup: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
-def planning_clearance_radius_from_setup(setup: Dict[str, Any]) -> float:
+def planning_clearance_extents_from_setup(setup: Dict[str, Any]) -> Tuple[float, float]:
+    """Return the axis-aligned body clearance used by the grid planner.
+
+    Planning used to inflate walls by the body's circumscribed-circle radius.
+    That made visible free cells unavailable even when the rectangular TurtleBot
+    footprint would not contact a wall.  The map editor and the fallback A*
+    planner instead use the actual body dimensions plus configured clearance.
+    Runtime LiDAR collision handling remains orientation-aware.
+    """
     footprint = effective_footprint_from_setup(setup)
-    footprint_radius = math.hypot(
-        max(float(footprint["front"]), float(footprint["back"])),
-        max(float(footprint["left"]), float(footprint["right"])),
-    )
     planner = setup.get("planner", {}) or {}
     object_config = setup.get("object", {}) or {}
     try:
@@ -748,7 +751,11 @@ def planning_clearance_radius_from_setup(setup: Dict[str, Any]) -> float:
         obstacle_clearance = max(0.0, float(object_config.get("inflation") or 0.0))
     except (TypeError, ValueError):
         obstacle_clearance = 0.0
-    return footprint_radius + hard_clearance + obstacle_clearance
+    extra = hard_clearance + obstacle_clearance
+    return (
+        max(float(footprint["front"]), float(footprint["back"])) + extra,
+        max(float(footprint["left"]), float(footprint["right"])) + extra,
+    )
 
 
 def robot_avoidance_obstacles(
@@ -1063,7 +1070,8 @@ def fallback_path_hits_dynamic_obstacle(
     pose: Dict[str, Any],
     obstacles: list[Dict[str, Any]],
     lookahead: float = FALLBACK_DYNAMIC_REPLAN_LOOKAHEAD,
-    clearance: float = 0.0,
+    clearance_x: float = 0.0,
+    clearance_y: Optional[float] = None,
 ) -> bool:
     """Detect an active temporary LiDAR cell on the next part of a fallback path."""
     if not path or not obstacles or lookahead <= 0.0:
@@ -1077,13 +1085,15 @@ def fallback_path_hits_dynamic_obstacle(
         return False
 
     remaining = lookahead
+    clearance_x = max(0.0, float(clearance_x))
+    clearance_y = clearance_x if clearance_y is None else max(0.0, float(clearance_y))
     valid_obstacles = []
     for obstacle in obstacles:
         try:
             obstacle_x = float(obstacle["x"])
             obstacle_y = float(obstacle["y"])
-            half_width = max(0.0, float(obstacle.get("width", 0.0)) / 2.0) + clearance
-            half_height = max(0.0, float(obstacle.get("height", 0.0)) / 2.0) + clearance
+            half_width = max(0.0, float(obstacle.get("width", 0.0)) / 2.0) + clearance_x
+            half_height = max(0.0, float(obstacle.get("height", 0.0)) / 2.0) + clearance_y
         except (KeyError, TypeError, ValueError):
             continue
         valid_obstacles.append((obstacle_x, obstacle_y, half_width, half_height))
@@ -2263,6 +2273,30 @@ def fallback_inflated_cells(
     return inflated
 
 
+def fallback_inflated_cells_for_extents(
+    blocked: set[Tuple[int, int]],
+    clearance_x: float,
+    clearance_y: float,
+    metrics: Dict[str, Any],
+) -> set[Tuple[int, int]]:
+    """Expand occupied cells by the rectangular robot footprint in map axes."""
+    cell_size = float(metrics["cellSize"])
+    clearance_x = max(0.0, float(clearance_x))
+    clearance_y = max(0.0, float(clearance_y))
+    x_cells = math.ceil(clearance_x / cell_size)
+    y_cells = math.ceil(clearance_y / cell_size)
+    inflated = set(blocked)
+    for cell_x, cell_y in blocked:
+        for offset_x in range(-x_cells, x_cells + 1):
+            for offset_y in range(-y_cells, y_cells + 1):
+                if abs(offset_x) * cell_size > clearance_x or abs(offset_y) * cell_size > clearance_y:
+                    continue
+                next_cell = cell_x + offset_x, cell_y + offset_y
+                if 0 <= next_cell[0] < int(metrics["cols"]) and 0 <= next_cell[1] < int(metrics["rows"]):
+                    inflated.add(next_cell)
+    return inflated
+
+
 def fallback_route_path_ends(
     path: list[Dict[str, Any]], route_length: int
 ) -> Dict[int, int]:
@@ -2341,10 +2375,14 @@ def fallback_replan_path(
             for grid_y in range(min_cell[1], max_cell[1] + 1):
                 blocked.add((grid_x, grid_y))
 
-    clearance = planning_clearance_radius_from_setup(setup)
+    clearance_x, clearance_y = planning_clearance_extents_from_setup(setup)
     soft_distance = normalized_fallback_settings(setup)["softDistance"]
-    inflated = fallback_inflated_cells(blocked, clearance, metrics)
-    soft_inflated = fallback_inflated_cells(blocked, clearance + soft_distance, metrics)
+    inflated = fallback_inflated_cells_for_extents(
+        blocked, clearance_x, clearance_y, metrics
+    )
+    soft_inflated = fallback_inflated_cells_for_extents(
+        blocked, clearance_x + soft_distance, clearance_y + soft_distance, metrics
+    )
 
     remaining_route = route[max(0, int(route_index)) :]
     if not remaining_route:
@@ -6318,7 +6356,9 @@ class RosBridge:
         last_safe_safety: Optional[Dict[str, Any]] = None
         recovery_started_at: Optional[float] = None
         last_replan_at = -math.inf
-        dynamic_replan_clearance = planning_clearance_radius_from_setup(fallback_setup)
+        dynamic_replan_clearance_x, dynamic_replan_clearance_y = (
+            planning_clearance_extents_from_setup(fallback_setup)
+        )
         period = 0.1
         try:
             while not self._shutdown_event.is_set() and self._fallback_generation_current(generation):
@@ -6619,7 +6659,8 @@ class RosBridge:
                     path_index,
                     pose,
                     dynamic_obstacles,
-                    clearance=dynamic_replan_clearance,
+                    clearance_x=dynamic_replan_clearance_x,
+                    clearance_y=dynamic_replan_clearance_y,
                 )
                 blocked = bool(safety["recoveryRequired"]) or dynamic_path_blocked
                 if not blocked and not bool(safety["collision"]):
