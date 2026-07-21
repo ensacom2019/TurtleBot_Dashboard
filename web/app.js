@@ -15,6 +15,7 @@ const state = {
   setupTool: "pose",
   setupDrag: null,
   setupDirty: false,
+  setupSaving: false,
   setupObjectRect: null,
   mapEditor: {
     raster: null,
@@ -75,7 +76,8 @@ function bindElements() {
   for (const id of [
     "connectionText",
     "saveSetupButton",
-    "applyInitialPoseButton",
+    "setupSaveStatus",
+    "setupToolHint",
     "mapSelect",
     "mapResolution",
     "mapOriginX",
@@ -250,7 +252,6 @@ function bindTabs() {
 function bindActions() {
   els.mapSelect.addEventListener("change", selectSavedMap);
   els.saveSetupButton.addEventListener("click", saveSetup);
-  els.applyInitialPoseButton.addEventListener("click", applyInitialPose);
   els.sendGoalButton.addEventListener("click", sendGoal);
   els.resumeRouteButton.addEventListener("click", resumeRoute);
   els.goalModeButton.addEventListener("click", () => setWaypointMode(false));
@@ -1654,28 +1655,67 @@ function loadMapImage(url) {
 }
 
 async function saveSetup(options = {}) {
+  if (state.setupSaving) return;
   const payload = readSetupForm();
-  const result = await postJson("/api/setup", payload);
-  state.setupDirty = false;
-  if (result.state) applyState(result.state);
-  if (options.successMessage) {
-    toast(options.successMessage);
-  } else {
-    showResult(result);
+  state.setupSaving = true;
+  els.saveSetupButton.disabled = true;
+  setSetupSaveStatus("saving", "저장·적용 중...");
+  try {
+    const result = await postJson("/api/setup", payload);
+    if (result.rosReload?.ok === false) {
+      throw new Error(result.rosReload.message || "ROS 브릿지를 다시 연결하지 못했습니다. 설정은 화면에 유지합니다.");
+    }
+    const mismatch = savedConnectionMismatch(result.state?.setup, payload);
+    if (mismatch) {
+      throw new Error(`저장 결과가 입력값과 다릅니다 (${mismatch}). 다른 대시보드 서버가 실행 중인지 확인하세요.`);
+    }
+    state.setupDirty = false;
+    state.setupDrag = null;
+    state.setupObjectRect = null;
+    if (result.state) applyState(result.state);
+    const initialPoseApplied = Boolean(result.initialPoseApply?.ok);
+    setSetupSaveStatus(
+      "saved",
+      initialPoseApplied ? "저장됨 · 초기 위치 전송 완료" : "저장·적용됨",
+    );
+    if (options.successMessage) {
+      toast(options.successMessage);
+    } else {
+      toast(initialPoseApplied ? "설정을 저장하고 초기 위치를 전송했습니다." : "설정을 저장·적용했습니다.");
+      showResult(result);
+    }
+  } catch (error) {
+    state.setupDirty = true;
+    setSetupSaveStatus("error", "저장 실패 · 변경사항 유지됨");
+    throw error;
+  } finally {
+    state.setupSaving = false;
+    els.saveSetupButton.disabled = false;
   }
 }
 
-async function applyInitialPose() {
-  const payload = {
-    x: numberValue(els.initialX),
-    y: numberValue(els.initialY),
-    yaw: numberValue(els.initialYaw),
-  };
-  const result = await postJson("/api/initial_pose", payload);
-  state.setupDirty = false;
-  if (result.state) applyState(result.state);
-  planPathToGoal();
-  showResult(result);
+function savedConnectionMismatch(savedSetup, expectedSetup) {
+  const activeRobot = expectedSetup?.activeRobot;
+  const expected = expectedSetup?.robotProfiles?.[activeRobot]?.connection || {};
+  const actual = savedSetup?.robotProfiles?.[activeRobot]?.connection || {};
+  if (!activeRobot || !savedSetup?.robotProfiles?.[activeRobot]) return "선택 로봇 프로필";
+  const fields = [
+    ["robotIp", "로봇 IP"],
+    ["robotSshHost", "SSH Host"],
+    ["robotSshUser", "SSH 사용자"],
+    ["rosLocalhostOnly", "ROS localhost 설정"],
+  ];
+  for (const [key, label] of fields) {
+    if (String(actual[key] ?? "") !== String(expected[key] ?? "")) return label;
+  }
+  if (Number(actual.rosDomainId) !== Number(expected.rosDomainId)) return "ROS Domain";
+  return "";
+}
+
+function setSetupSaveStatus(status, message) {
+  if (!els.setupSaveStatus) return;
+  els.setupSaveStatus.textContent = message;
+  els.setupSaveStatus.dataset.status = status;
 }
 
 async function sendGoal() {
@@ -3215,6 +3255,7 @@ function setupInputs() {
 
 function markSetupDirty() {
   state.setupDirty = true;
+  if (!state.setupSaving) setSetupSaveStatus("dirty", "변경사항 있음");
   syncSetupShadow();
 }
 
@@ -3247,6 +3288,15 @@ function setSetupTool(tool) {
     button.classList.toggle("active", button.dataset.setupTool === tool);
   });
   els.setupMapCanvas.dataset.tool = tool;
+  const hints = {
+    pose: "초기: 지도를 클릭하거나 드래그해 시작 위치와 방향을 지정합니다.",
+    robot: "몸체: 로봇 외곽을 드래그해 길이와 너비를 조절합니다.",
+    accessory: "부속품: 로봇 가장자리를 드래그해 돌출부를 조절합니다.",
+    object: "오브젝트: 지도에서 클릭·드래그를 끝내면 장애물로 등록됩니다. 주황 점선은 드래그 중 미리보기이며 저장 대상이 아닙니다.",
+    wall: "벽: 지도 위를 드래그해 통행 불가 셀을 칠합니다.",
+    erase: "지우기: 지도 위를 드래그해 직접 칠한 벽을 지웁니다.",
+  };
+  if (els.setupToolHint) els.setupToolHint.textContent = hints[tool] || "";
 }
 
 function onSetupPointerDown(event) {
@@ -4283,9 +4333,7 @@ function drawSetupObject(ctx, canvas, setup, pose) {
   normalizeObstacles(setup.obstacles || []).forEach((obstacle, index) => {
     drawObstacleRect(ctx, canvas, obstacle, `#${index + 1}`, false);
   });
-  if (state.setupTool !== "object" && !state.setupObjectRect) return;
-  const rect = state.setupObjectRect || defaultObjectRect(setup, pose);
-  drawObstacleRect(ctx, canvas, rect, "new", true);
+  if (state.setupObjectRect) drawObstacleRect(ctx, canvas, state.setupObjectRect, "new", true);
 }
 
 function drawAvoidanceRobots(ctx, canvas, setup) {
@@ -4337,15 +4385,6 @@ function drawObstacleRect(ctx, canvas, rect, label, dashed) {
   ctx.font = `${Math.max(11, Math.round(12 * (window.devicePixelRatio || 1)))}px sans-serif`;
   ctx.fillText(label, x + 8, y - 8);
   ctx.restore();
-}
-
-function defaultObjectRect(setup, pose) {
-  return {
-    x: pose.x + setup.robot.length + setup.object.width / 2 + 0.25,
-    y: pose.y,
-    width: setup.object.width,
-    height: setup.object.height,
-  };
 }
 
 function drawHandle(ctx, x, y, color) {

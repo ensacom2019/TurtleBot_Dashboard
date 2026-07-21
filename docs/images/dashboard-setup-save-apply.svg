@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">TurtleBot Dashboard setup save and apply</title>
+  <desc id="desc">Dashboard setup screen showing the one Save and Apply workflow.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#101826"/><stop offset="1" stop-color="#172338"/></linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#020617" flood-opacity=".38"/></filter>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <rect x="36" y="32" width="1528" height="836" rx="20" fill="#f7f9fc" filter="url(#shadow)"/>
+  <rect x="36" y="32" width="1528" height="72" rx="20" fill="#182536"/><rect x="36" y="84" width="1528" height="20" fill="#182536"/>
+  <circle cx="76" cy="68" r="14" fill="#ff8f40"/><text x="104" y="76" font-family="Arial, sans-serif" font-size="27" font-weight="700" fill="#fff">TurtleBot Dashboard</text>
+  <text x="1295" y="75" font-family="Arial, sans-serif" font-size="18" fill="#b9c8da">Active Robot</text><rect x="1402" y="50" width="124" height="36" rx="9" fill="#29445c"/><text x="1420" y="74" font-family="Arial, sans-serif" font-size="16" fill="#fff">TurtleBot 2</text>
+  <rect x="65" y="133" width="1470" height="58" rx="12" fill="#fff" stroke="#d9e1ea"/>
+  <text x="91" y="169" font-family="Arial, sans-serif" font-size="27" font-weight="700" fill="#1f2e40">셋업 맵</text>
+  <circle cx="1212" cy="162" r="7" fill="#94a3b8"/><text x="1229" y="169" font-family="Arial, sans-serif" font-size="17" fill="#64748b">변경 사항 없음</text>
+  <rect x="1364" y="145" width="143" height="36" rx="8" fill="#f47732"/><text x="1389" y="169" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#fff">저장·적용</text>
+  <rect x="65" y="215" width="1015" height="612" rx="13" fill="#fff" stroke="#d9e1ea"/>
+  <rect x="88" y="239" width="969" height="48" rx="8" fill="#f3f6fa"/>
+  <rect x="104" y="250" width="92" height="27" rx="6" fill="#f47732"/><text x="124" y="270" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#fff">초기 위치</text>
+  <rect x="208" y="250" width="72" height="27" rx="6" fill="#dce5ef"/><text x="223" y="270" font-family="Arial, sans-serif" font-size="14" fill="#40536a">로봇</text>
+  <rect x="292" y="250" width="72" height="27" rx="6" fill="#dce5ef"/><text x="307" y="270" font-family="Arial, sans-serif" font-size="14" fill="#40536a">물체</text>
+  <rect x="376" y="250" width="72" height="27" rx="6" fill="#dce5ef"/><text x="392" y="270" font-family="Arial, sans-serif" font-size="14" fill="#40536a">벽</text>
+  <rect x="460" y="250" width="72" height="27" rx="6" fill="#dce5ef"/><text x="476" y="270" font-family="Arial, sans-serif" font-size="14" fill="#40536a">지우기</text>
+  <text x="102" y="319" font-family="Arial, sans-serif" font-size="16" fill="#64748b">초기: 지도를 클릭하거나 드래그해 시작 위치와 방향을 지정합니다.</text>
+  <rect x="88" y="343" width="969" height="460" rx="10" fill="#e9eff5"/>
+  <g stroke="#cbd5e1" stroke-width="1"><path d="M168 343v460M248 343v460M328 343v460M408 343v460M488 343v460M568 343v460M648 343v460M728 343v460M808 343v460M888 343v460M968 343v460"/><path d="M88 423h969M88 503h969M88 583h969M88 663h969M88 743h969"/></g>
+  <path d="M169 671h178v-132h250v144h165V475h197" fill="none" stroke="#5e7188" stroke-width="18" stroke-linejoin="round"/>
+  <rect x="788" y="566" width="95" height="61" rx="5" fill="#f4a261" opacity=".88"/>
+  <circle cx="514" cy="526" r="25" fill="#f47732" stroke="#fff" stroke-width="7"/><path d="M514 471v46M514 471l-15 19M514 471l15 19" stroke="#f47732" stroke-width="8" stroke-linecap="round"/>
+  <text x="470" y="581" font-family="Arial, sans-serif" font-size="15" fill="#41566f">초기 위치</text>
+  <rect x="1106" y="215" width="429" height="612" rx="13" fill="#fff" stroke="#d9e1ea"/>
+  <text x="1132" y="255" font-family="Arial, sans-serif" font-size="23" font-weight="700" fill="#1f2e40">초기 위치</text>
+  <text x="1132" y="290" font-family="Arial, sans-serif" font-size="16" fill="#64748b">셋업 저장 시 /initialpose로 전송됩니다.</text>
+  <text x="1132" y="336" font-family="Arial, sans-serif" font-size="15" fill="#64748b">X (m)</text><rect x="1132" y="348" width="170" height="42" rx="7" fill="#f7f9fc" stroke="#cbd5e1"/><text x="1148" y="375" font-family="Arial, sans-serif" font-size="18" fill="#334155">0.00</text>
+  <text x="1320" y="336" font-family="Arial, sans-serif" font-size="15" fill="#64748b">Y (m)</text><rect x="1320" y="348" width="170" height="42" rx="7" fill="#f7f9fc" stroke="#cbd5e1"/><text x="1336" y="375" font-family="Arial, sans-serif" font-size="18" fill="#334155">0.00</text>
+  <text x="1132" y="438" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#1f2e40">로봇 연결</text>
+  <text x="1132" y="475" font-family="Arial, sans-serif" font-size="15" fill="#64748b">Robot IP</text><rect x="1132" y="487" width="358" height="42" rx="7" fill="#f7f9fc" stroke="#cbd5e1"/><text x="1148" y="514" font-family="Arial, sans-serif" font-size="18" fill="#334155">192.168.0.101</text>
+  <text x="1132" y="573" font-family="Arial, sans-serif" font-size="15" fill="#64748b">ROS Domain ID</text><rect x="1132" y="585" width="358" height="42" rx="7" fill="#f7f9fc" stroke="#cbd5e1"/><text x="1148" y="612" font-family="Arial, sans-serif" font-size="18" fill="#334155">1</text>
+  <rect x="1132" y="686" width="358" height="63" rx="9" fill="#fff7ed" stroke="#fdba74"/><text x="1152" y="716" font-family="Arial, sans-serif" font-size="16" font-weight="700" fill="#c2410c">한 번의 저장·적용</text><text x="1152" y="739" font-family="Arial, sans-serif" font-size="14" fill="#9a3412">연결, 토픽, 초기 위치를 함께 반영</text>
+</svg>

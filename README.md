@@ -10,7 +10,7 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 
 처음에는 기본 프로필인 `TurtleBot 2`만 표시됩니다. Active Robot 옆 검색 버튼으로 같은 사설 네트워크의 ROS/SSH 후보를 검색하면 발견된 로봇을 프로필로 추가할 수 있습니다. 검색되지 않는 로봇은 셋업의 `+` 버튼으로 직접 추가하고, **각 프로필별로** Robot IP, SSH Host/User/Password, `ROS_DOMAIN_ID`를 입력해 저장합니다. 로봇별 Domain을 분리하면 토픽 이름은 모두 `/scan`, `/amcl_pose`처럼 같아도 됩니다.
 
-프로필을 선택하면 그 로봇만 제어 대상이 됩니다. `선택 로봇 브링업`과 `선택 로봇 종료`는 선택한 프로필의 SSH와 Domain으로만 동작합니다. 다른 프로필은 Domain별 ROS worker가 pose를 구독하여 지도상의 회피 장애물로 반영하며, pose를 아직 받지 못한 경우에는 수동 위치값을 사용합니다.
+프로필을 선택하면 그 로봇만 제어 대상이 됩니다. `선택 로봇 브링업`과 `선택 로봇 종료`는 선택한 프로필의 SSH와 Domain으로만 동작합니다. 다른 프로필은 Domain별 ROS worker가 `/amcl_pose`를 구독해 같은 지도 좌표계에 표시합니다. 따라서 여러 로봇의 위치를 동시에 보려면 각 로봇이 서로 다른 Domain에서 AMCL을 실행하고 같은 맵 원점을 사용해야 합니다. `/amcl_pose`가 없는 로봇은 등록된 수동 위치값만 표시됩니다.
 
 `OpenCR 확인`은 로봇 SSH에서 OpenCR의 정상 CDC 식별자(STM32 `0483:5740`)를 확인하고, Arduino/알 수 없는 ACM 장치는 거부합니다. 이어 `turtlebot3_node`, `/odom` publisher, `/cmd_vel` subscriber까지 검사해 단순 USB 연결과 실제 TurtleBot base 준비 상태를 구분합니다.
 
@@ -20,7 +20,9 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 
 지도, 벽, 장애물, 로봇 footprint와 안전 반경을 한 화면에서 설정합니다.
 
-![TurtleBot Dashboard setup screen](docs/images/dashboard-overview.png)
+셋업의 변경은 상단 `저장·적용` 버튼 하나로 저장됩니다. 선택 로봇의 IP·SSH·ROS Domain·토픽도 함께 반영되며, 초기 위치를 바꾼 경우에는 같은 동작으로 `/initialpose` 전송까지 수행합니다. 저장 결과가 입력한 로봇 연결값과 다르면 화면의 변경사항을 유지하고 오류로 표시합니다.
+
+![TurtleBot Dashboard setup save and apply](docs/images/dashboard-setup-save-apply.svg)
 
 ### 주행 대시보드
 

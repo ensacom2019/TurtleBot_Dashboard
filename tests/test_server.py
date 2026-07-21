@@ -611,6 +611,31 @@ class ServerHelpersTest(unittest.TestCase):
         command = "export ROS_DOMAIN_ID=7 && export ROS_LOCALHOST_ONLY=0 && ros2 topic list"
         self.assertEqual(report.count(command), 2)
 
+    def test_diagnostics_report_redacts_robot_profile_passwords(self) -> None:
+        report = server.format_diagnostics_report(
+            {
+                "setup": {
+                    "network": {},
+                    "topics": {},
+                    "robotProfiles": {
+                        "tb3_1": {"connection": {"robotSshPassword": "secret-value"}}
+                    },
+                    "fallbackNavigation": {},
+                },
+                "runtime": {},
+            },
+            {"ok": False, "checks": [], "advice": []},
+        )
+        self.assertNotIn("secret-value", report)
+        self.assertIn('"robotSshPasswordConfigured": true', report)
+
+    def test_connection_info_uses_selected_robot_profile_domain(self) -> None:
+        connection = server.base_connection_info(
+            network={"rosDomainId": "7", "rosLocalhostOnly": "0"}
+        )
+        self.assertEqual(connection["rosDomainId"], "7")
+        self.assertEqual(connection["rosLocalhostOnly"], "0")
+
     def test_same_subnet_hosts_stays_within_private_24(self) -> None:
         subnet, hosts = server.same_subnet_hosts("192.168.20.3")
         self.assertEqual(str(subnet), "192.168.20.0/24")

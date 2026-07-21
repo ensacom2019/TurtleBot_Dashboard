@@ -24,8 +24,11 @@
         <div class="setup-grid">
           <section class="panel">
             <div class="panel-head">
-              <h2>맵</h2>
-              <button id="saveSetupButton" class="primary">저장</button>
+              <h2>셋업 맵</h2>
+              <div class="setup-save-actions">
+                <span id="setupSaveStatus" class="setup-save-status" role="status">변경 사항 없음</span>
+                <button id="saveSetupButton" class="primary" type="button" title="모든 셋업 변경을 저장하고 선택 로봇 연결을 다시 적용합니다.">저장·적용</button>
+              </div>
             </div>
             <div class="tool-strip" role="group" aria-label="셋업 조작">
               <button type="button" class="tool-button active" data-setup-tool="pose">초기</button>
@@ -35,6 +38,7 @@
               <button type="button" class="tool-button" data-setup-tool="wall">벽</button>
               <button type="button" class="tool-button" data-setup-tool="erase">지우기</button>
             </div>
+            <p id="setupToolHint" class="setup-tool-hint">초기: 지도를 클릭하거나 드래그해 시작 위치와 방향을 지정합니다.</p>
             <div class="form-grid">
               <label>
                 저장된 맵
@@ -97,7 +101,6 @@
           <section class="panel">
             <div class="panel-head">
               <h2>초기 위치</h2>
-              <button id="applyInitialPoseButton" class="primary">적용</button>
             </div>
             <div class="form-grid compact">
               <label>
@@ -113,6 +116,7 @@
                 <input id="initialYaw" type="number" step="0.01" />
               </label>
             </div>
+            <p class="setup-apply-hint">초기 위치를 바꾼 경우에도 위 <strong>저장·적용</strong> 버튼 하나로 저장하고 로봇에 전송합니다.</p>
 
             <h2>몸체</h2>
             <div class="form-grid compact">

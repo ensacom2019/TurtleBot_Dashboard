@@ -1596,11 +1596,14 @@ def discover_same_subnet_ssh_hosts(network: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def base_connection_info(
-    action_available: bool = False, route_action_available: bool = False
+    action_available: bool = False,
+    route_action_available: bool = False,
+    network: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    configured = network if isinstance(network, dict) else {}
     return {
-        "rosDomainId": os.environ.get("ROS_DOMAIN_ID", ""),
-        "rosLocalhostOnly": os.environ.get("ROS_LOCALHOST_ONLY", ""),
+        "rosDomainId": str(configured.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID", "")),
+        "rosLocalhostOnly": str(configured.get("rosLocalhostOnly") or os.environ.get("ROS_LOCALHOST_ONLY", "")),
         "rmwImplementation": os.environ.get("RMW_IMPLEMENTATION", ""),
         "serverIps": local_ip_addresses(),
         "actionAvailable": action_available,
@@ -3698,7 +3701,9 @@ def format_diagnostics_report(
     network = redacted_network(setup.get("network", {}))
     topics = setup.get("topics", {})
     active_robot = setup.get("activeRobot") or "-"
-    robot_profiles = setup.get("robotProfiles", {})
+    # Diagnostics are frequently copied outside the robot network. Never include
+    # stored SSH secrets in that export.
+    robot_profiles = public_robot_profiles(setup.get("robotProfiles", {}))
     scan_topic = topics.get("scan") or "/scan"
     odom_topic = topics.get("odom") or "/odom"
     cmd_topic = topics.get("cmdVel") or "/cmd_vel"
@@ -4727,7 +4732,7 @@ class NullRosBridge:
                 "mode": "offline-preview",
                 "rosBridgeError": self.bridge_error,
                 "navMessage": f"ROS2 bridge unavailable: {self.bridge_error}",
-                "connection": base_connection_info(False),
+                "connection": base_connection_info(False, network=state.get_setup().get("network", {})),
             }
         )
 
@@ -4917,7 +4922,7 @@ class NullRosBridge:
             "ok": True,
             "mode": "offline-preview",
             "runtime": snapshot["runtime"],
-            "connection": base_connection_info(False),
+            "connection": base_connection_info(False, network=snapshot["setup"].get("network", {})),
             "topics": snapshot["setup"]["topics"],
             "network": public_network(snapshot["setup"].get("network", {})),
         }
@@ -4973,7 +4978,7 @@ class NullRosBridge:
                 *dashboard_access_advice(detected_server_ip or network.get("serverIp", "")),
             ],
             "runtime": snapshot["runtime"],
-            "connection": base_connection_info(False),
+            "connection": base_connection_info(False, network=network),
             "network": public_network(network),
         }
 
@@ -5020,7 +5025,7 @@ class NullRosBridge:
         return {
             "ok": True,
             "mode": "offline-preview",
-            "connection": base_connection_info(False),
+            "connection": base_connection_info(False, network=network),
             "topics": [],
             "nodes": [],
             "candidates": [],
@@ -5351,7 +5356,9 @@ class RosBridge:
                 "navMessage": f"ROS2 bridge started. cmd_vel: {self.topics['cmdVel']} ({self._cmd_vel_type_label()}).",
                 "cmdVelMessageType": self.cmd_vel_msg_type,
                 "connection": base_connection_info(
-                    self._action_available(0.01), self._route_action_available(0.01)
+                    self._action_available(0.01),
+                    self._route_action_available(0.01),
+                    active_robot_network(self.setup),
                 ),
                 **self._cmd_vel_clock_status(),
             }
@@ -7883,8 +7890,11 @@ class RosBridge:
         if self._is_fallback():
             return self._fallback.connection_status()
         self._ensure_cmd_vel_publisher_type()
+        snapshot = self.state.snapshot()
         connection = base_connection_info(
-            self._action_available(0.05), self._route_action_available(0.05)
+            self._action_available(0.05),
+            self._route_action_available(0.05),
+            snapshot["setup"].get("network", {}),
         )
         self.state.update_runtime({"connection": connection})
         snapshot = self.state.snapshot()
@@ -7922,9 +7932,10 @@ class RosBridge:
         actions = self._action_names()
         action_available = self._action_available(0.2)
         route_action_available = self._route_action_available(0.2)
-        connection = base_connection_info(action_available, route_action_available)
+        connection = base_connection_info(action_available, route_action_available, network)
         candidate = self._score_turtlebot_candidate(topic_names, dict(topics_and_types), nodes, actions)
         recommended_topics = candidate.get("recommendedTopics", {}) if candidate.get("score", 0) >= 50 else {}
+        context_domain = str(connection.get("rosDomainId") or "")
         env_domain = os.environ.get("ROS_DOMAIN_ID", "")
         expected_domain = str(network.get("rosDomainId") or "")
         env_localhost = os.environ.get("ROS_LOCALHOST_ONLY", "")
@@ -7954,8 +7965,8 @@ class RosBridge:
         add_check(
             "domain",
             "ROS_DOMAIN_ID",
-            bool(env_domain) and (not expected_domain or env_domain == expected_domain),
-            f"환경값 {env_domain or '-'} / 설정값 {expected_domain or '-'}",
+            bool(context_domain) and (not expected_domain or context_domain == expected_domain),
+            f"브릿지 Context {context_domain or '-'} / 설정값 {expected_domain or '-'} / 서버 환경 {env_domain or '-'}",
         )
         add_check(
             "localhost",
@@ -8608,7 +8619,7 @@ class RosBridge:
             "ok": True,
             "mode": "ros2",
             "connection": base_connection_info(
-                self._action_available(0.05), self._route_action_available(0.05)
+                self._action_available(0.05), self._route_action_available(0.05), network
             ),
             "topics": [{"name": name, "types": topic_types.get(name, [])} for name in topic_names],
             "nodes": nodes,
