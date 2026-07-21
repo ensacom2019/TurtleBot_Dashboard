@@ -121,6 +121,7 @@ function bindElements() {
     "nav2Footprint",
     "copyFootprintButton",
     "robotBringupButton",
+    "robotHardwareCheckButton",
     "robotSshDetailButton",
     "robotBringupStopButton",
     "robotCheckButton",
@@ -138,6 +139,7 @@ function bindElements() {
     "connScan",
     "connPose",
     "connNav2",
+    "connOpencr",
     "objectWidth",
     "objectHeight",
     "objectInflation",
@@ -258,6 +260,7 @@ function bindActions() {
   els.clearGridButton.addEventListener("click", clearBlockedCells);
   els.clearObstaclesButton.addEventListener("click", clearObstacles);
   els.robotBringupButton.addEventListener("click", robotBringup);
+  els.robotHardwareCheckButton.addEventListener("click", checkRobotHardware);
   els.robotSshDetailButton.addEventListener("click", () => robotSshCheck(true));
   els.robotBringupStopButton.addEventListener("click", stopRobotBringup);
   els.robotCheckButton.addEventListener("click", checkRobot);
@@ -781,6 +784,16 @@ function fillConnectionStatus(payload) {
   } else {
     els.connNav2.textContent = "Action 대기";
   }
+  const opencr = runtime.opencr || {};
+  if (opencr.ready) {
+    els.connOpencr.textContent = `정상 · ${opencr.port || "-"}`;
+  } else if (opencr.connected) {
+    els.connOpencr.textContent = `연결됨 · base 대기 (${opencr.port || "-"})`;
+  } else if (opencr.state && opencr.state !== "unknown") {
+    els.connOpencr.textContent = `점검 필요 · ${opencr.state}`;
+  } else {
+    els.connOpencr.textContent = "미확인";
+  }
 }
 
 async function refreshConnectionStatus() {
@@ -901,6 +914,53 @@ function closeRobotDiscoveryNotice() {
 async function persistSelectedRobotBeforeControl() {
   if (!state.setupDirty) return;
   await saveSetup({ successMessage: "선택 로봇 설정을 저장했습니다." });
+}
+
+async function checkRobotHardware() {
+  els.robotHardwareCheckButton.disabled = true;
+  els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>OpenCR와 base 드라이버를 SSH로 확인하는 중...</p></div>`;
+  try {
+    await persistSelectedRobotBeforeControl();
+    const payload = await postJson("/api/robot_hardware_check", {});
+    const hardware = payload.hardware || {};
+    if (state.data?.runtime) {
+      state.data.runtime.opencr = hardware;
+      fillConnectionStatus({ runtime: state.data.runtime });
+    }
+    const rows = [
+      ["OpenCR", hardware.state || "unknown"],
+      ["포트", hardware.port || "-"],
+      ["base service", hardware.baseService || "-"],
+      ["turtlebot3_node", hardware.turtlebotNode ? "present" : "missing"],
+      ["odom publishers", hardware.odomPublishers ?? 0],
+      ["cmd_vel subscribers", hardware.cmdVelSubscribers ?? 0],
+    ].map(([label, value]) => `<p><strong>${escapeHtml(label)}</strong>: ${escapeHtml(value)}</p>`).join("");
+    const stateText = hardware.ready
+      ? "OpenCR와 TurtleBot base 연결이 정상입니다."
+      : hardware.connected
+        ? "OpenCR는 연결됐지만 TurtleBot base가 준비되지 않았습니다. 브링업 상태를 확인하세요."
+        : "검증 가능한 OpenCR 연결이 아닙니다. Arduino 또는 알 수 없는 ACM 장치를 사용하지 않습니다.";
+    els.robotCheckResults.innerHTML = `
+      <div class="discovery-card">
+        <strong>${escapeHtml(stateText)}</strong>
+        <p>${escapeHtml(hardware.detail || "-")}</p>
+        ${rows}
+      </div>`;
+    els.diagnosticReport.classList.add("visible");
+    els.diagnosticReport.value = [
+      `$ ${payload.command || "robot hardware check"}`,
+      `returncode: ${payload.returncode ?? "-"}`,
+      "",
+      payload.stdout || "",
+      payload.stderr ? `\n[stderr]\n${payload.stderr}` : "",
+    ].filter(Boolean).join("\n");
+    toast(stateText);
+  } catch (error) {
+    els.robotCheckResults.innerHTML = `<div class="discovery-card"><p>${escapeHtml(error.message)}</p></div>`;
+    toast(error.message);
+  } finally {
+    els.robotHardwareCheckButton.disabled = false;
+  }
 }
 
 async function checkRobot() {

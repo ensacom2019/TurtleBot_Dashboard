@@ -354,6 +354,7 @@
                 <h2>연결 상태</h2>
                 <div class="button-row">
                   <button id="robotBringupButton" type="button" class="primary">선택 로봇 브링업</button>
+                  <button id="robotHardwareCheckButton" type="button">OpenCR 확인</button>
                   <button id="robotSshDetailButton" type="button">SSH 상세점검</button>
                   <button id="robotBringupStopButton" type="button" class="danger">선택 로봇 종료</button>
                   <button id="robotCheckButton" type="button">로봇 체크</button>
@@ -385,6 +386,10 @@
                 <div>
                   <dt>Nav2</dt>
                   <dd id="connNav2">-</dd>
+                </div>
+                <div>
+                  <dt>OpenCR</dt>
+                  <dd id="connOpencr">미확인</dd>
                 </div>
               </dl>
               <div id="robotCheckResults" class="robot-check-results"></div>

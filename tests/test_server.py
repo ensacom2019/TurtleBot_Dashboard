@@ -1312,13 +1312,60 @@ class ServerHelpersTest(unittest.TestCase):
         script = server.build_robot_bringup_script(
             server.DEFAULT_STATE["setup"]["network"]
         )
-        self.assertLess(script.index("/dev/ttyACM1"), script.index("/dev/ttyACM0"))
+        self.assertIn("OPENCR_CANDIDATES=(/dev/ttyACM*)", script)
         self.assertIn("is_opencr_port", script)
         self.assertIn("Arduino|Uno", script)
         self.assertIn("usb_port:=$opencr_port", script)
         self.assertIn("turtlebot-dashboard-base.service", script)
         self.assertIn("turtlebot3_node did not become ready", script)
         self.assertIn("Refusing to launch turtlebot3_node", script)
+
+    def test_robot_hardware_check_distinguishes_opencr_from_arduino(self) -> None:
+        script = server.build_robot_hardware_check_script(
+            server.DEFAULT_STATE["setup"]["network"],
+            server.DEFAULT_STATE["setup"]["topics"],
+        )
+        self.assertIn("ID_VENDOR_ID=0483", script)
+        self.assertIn("ID_MODEL_ID=5740", script)
+        self.assertIn("0483:df11", script)
+        self.assertIn("Arduino is never used as the TurtleBot base port", script)
+        self.assertIn("DASHBOARD_OPENCR_READY", script)
+        if shutil.which("bash"):
+            syntax_check = subprocess.run(
+                ["bash", "-n"], input=script.encode("utf-8"), capture_output=True, check=False
+            )
+            self.assertEqual(
+                syntax_check.returncode,
+                0,
+                syntax_check.stderr.decode("utf-8", errors="replace"),
+            )
+
+    def test_robot_hardware_markers_require_device_node_odom_and_cmd_vel(self) -> None:
+        parsed = server.parse_robot_hardware_check_output(
+            "\n".join(
+                [
+                    "DASHBOARD_OPENCR_STATE=verified",
+                    "DASHBOARD_OPENCR_PORT=/dev/ttyACM1",
+                    "DASHBOARD_OPENCR_ARDUINO_PORTS=/dev/ttyACM0",
+                    "DASHBOARD_OPENCR_BASE_SERVICE=active",
+                    "DASHBOARD_OPENCR_NODE=present",
+                    "DASHBOARD_OPENCR_ODOM_PUBLISHERS=1",
+                    "DASHBOARD_OPENCR_CMD_VEL_SUBSCRIBERS=1",
+                    "DASHBOARD_OPENCR_READY=true",
+                    "DASHBOARD_OPENCR_DETAIL=Verified OpenCR.",
+                ]
+            )
+        )
+        self.assertTrue(parsed["connected"])
+        self.assertTrue(parsed["ready"])
+        self.assertEqual(parsed["port"], "/dev/ttyACM1")
+        self.assertEqual(parsed["arduinoPorts"], ["/dev/ttyACM0"])
+
+        arduino_only = server.parse_robot_hardware_check_output(
+            "DASHBOARD_OPENCR_STATE=arduino_only\nDASHBOARD_OPENCR_READY=false"
+        )
+        self.assertFalse(arduino_only["connected"])
+        self.assertFalse(arduino_only["ready"])
 
     def test_ssh_diagnostics_checks_both_nav2_actions(self) -> None:
         topics = server.topics_for_namespace("/")

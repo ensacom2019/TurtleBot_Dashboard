@@ -10,6 +10,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -315,6 +316,14 @@ DEFAULT_STATE: Dict[str, Any] = {
             "serverIps": [],
             "actionAvailable": False,
             "routeActionAvailable": False,
+        },
+        "opencr": {
+            "state": "unknown",
+            "connected": False,
+            "ready": False,
+            "port": None,
+            "detail": "OpenCR hardware has not been checked yet.",
+            "checkedAt": None,
         },
     },
 }
@@ -2630,17 +2639,23 @@ is_opencr_port() {{
   [ -c "$port" ] || return 1
   local properties
   properties="$(udevadm info -q property -n "$port" 2>/dev/null || true)"
-  printf '%s\n' "$properties" | grep -Eiq '(^ID_MODEL(_ENC)?=.*OpenCR|^ID_SERIAL(_SHORT)?=.*OpenCR)' || return 1
   printf '%s\n' "$properties" | grep -Eiq 'Arduino|Uno' && return 1
-  return 0
+  # ROBOTIS' OpenCR CDC rule identifies the normal firmware device as
+  # STM32 0483:5740.  Keep the OpenCR text check as a compatibility fallback.
+  printf '%s\n' "$properties" | grep -Eiq '^ID_VENDOR_ID=0483$' || {{
+    printf '%s\n' "$properties" | grep -Eiq '(^ID_MODEL(_ENC)?=.*OpenCR|^ID_SERIAL(_SHORT)?=.*OpenCR)' || return 1
+    return 0
+  }}
+  printf '%s\n' "$properties" | grep -Eiq '^ID_MODEL_ID=5740$'
 }}
 
 OPENCR_PORT=""
-for candidate in /dev/ttyACM1 /dev/ttyACM0; do
-  if [ ! -e "$candidate" ]; then
-    echo "[INFO] OpenCR candidate absent: $candidate"
-    continue
-  fi
+shopt -s nullglob
+OPENCR_CANDIDATES=(/dev/ttyACM*)
+if [ "${{#OPENCR_CANDIDATES[@]}}" -eq 0 ]; then
+  echo "[INFO] No /dev/ttyACM candidate is present."
+fi
+for candidate in "${{OPENCR_CANDIDATES[@]}}"; do
   echo "[CHECK] OpenCR candidate: $candidate"
   udevadm info -q property -n "$candidate" 2>/dev/null | grep -E 'DEVNAME|ID_VENDOR|ID_MODEL|ID_SERIAL' || true
   if is_opencr_port "$candidate"; then
@@ -2652,7 +2667,7 @@ for candidate in /dev/ttyACM1 /dev/ttyACM0; do
 done
 
 if [ -z "$OPENCR_PORT" ]; then
-  echo "[FAIL] No verified ROBOTIS OpenCR found on /dev/ttyACM1 or /dev/ttyACM0."
+  echo "[FAIL] No verified ROBOTIS OpenCR (STM32 0483:5740) found on /dev/ttyACM*."
   echo "[FAIL] Refusing to launch turtlebot3_node against Arduino Uno or an unknown serial device."
   BRINGUP_FAIL=11
 elif systemctl --user is-active --quiet "$BASE_SERVICE"; then
@@ -2994,6 +3009,134 @@ code=$?
 echo "DASHBOARD_CMD_VEL_ECHO_RC=$code"
 exit "$code"
 """
+
+
+def build_robot_hardware_check_script(network: Dict[str, Any], topics: Dict[str, Any]) -> str:
+    """Return a machine-readable OpenCR/base-driver health probe for one robot."""
+    domain = shlex.quote(str(network.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or "1"))
+    localhost_only = shlex.quote(str(network.get("rosLocalhostOnly") or "0"))
+    odom_topic = shlex.quote(str(topics.get("odom") or "/odom"))
+    cmd_vel_topic = shlex.quote(str(topics.get("cmdVel") or "/cmd_vel"))
+    return f"""#!/usr/bin/env bash
+set +e
+export ROS_DOMAIN_ID={domain}
+export ROS_LOCALHOST_ONLY={localhost_only}
+export ROS2CLI_NO_DAEMON=1
+USER_UID="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$USER_UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+
+is_opencr_port() {{
+  local port="$1" properties
+  [ -c "$port" ] || return 1
+  properties="$(udevadm info -q property -n "$port" 2>/dev/null || true)"
+  printf '%s\n' "$properties" | grep -Eiq 'Arduino|Uno' && return 1
+  if printf '%s\n' "$properties" | grep -Eiq '^ID_VENDOR_ID=0483$'; then
+    printf '%s\n' "$properties" | grep -Eiq '^ID_MODEL_ID=5740$' && return 0
+  fi
+  printf '%s\n' "$properties" | grep -Eiq '(^ID_MODEL(_ENC)?=.*OpenCR|^ID_SERIAL(_SHORT)?=.*OpenCR)'
+}}
+
+OPENCR_PORT=""
+ARDUINO_PORT=""
+UNKNOWN_PORTS=""
+shopt -s nullglob
+for port in /dev/ttyACM*; do
+  properties="$(udevadm info -q property -n "$port" 2>/dev/null || true)"
+  if is_opencr_port "$port"; then
+    OPENCR_PORT="$port"
+    break
+  elif printf '%s\n' "$properties" | grep -Eiq 'Arduino|Uno'; then
+    ARDUINO_PORT="${{ARDUINO_PORT:+$ARDUINO_PORT,}}$port"
+  else
+    UNKNOWN_PORTS="${{UNKNOWN_PORTS:+$UNKNOWN_PORTS,}}$port"
+  fi
+done
+
+OPENCR_STATE="absent"
+OPENCR_DETAIL="No verified OpenCR CDC device was found."
+if [ -n "$OPENCR_PORT" ]; then
+  OPENCR_STATE="verified"
+  OPENCR_DETAIL="Verified OpenCR CDC device (STM32 0483:5740 or OpenCR identity)."
+elif command -v lsusb >/dev/null 2>&1 && lsusb -d 0483:df11 >/dev/null 2>&1; then
+  OPENCR_STATE="bootloader"
+  OPENCR_DETAIL="OpenCR is in STM32 DFU bootloader mode; TurtleBot firmware is not running."
+elif [ -n "$ARDUINO_PORT" ]; then
+  OPENCR_STATE="arduino_only"
+  OPENCR_DETAIL="Arduino device found, but no verified OpenCR. Arduino is never used as the TurtleBot base port."
+elif [ -n "$UNKNOWN_PORTS" ]; then
+  OPENCR_STATE="unknown_acm"
+  OPENCR_DETAIL="Unknown ACM serial device found; it is not accepted as OpenCR."
+fi
+
+ROS_READY=0
+TURTLEBOT_NODE="missing"
+BASE_SERVICE="unknown"
+ODOM_PUBLISHERS=0
+CMD_VEL_SUBSCRIBERS=0
+if source /opt/ros/jazzy/setup.bash 2>/dev/null; then
+  [ -f "$HOME/turtlebot3_ws/install/setup.bash" ] && source "$HOME/turtlebot3_ws/install/setup.bash"
+  ROS_READY=1
+  systemctl --user is-active --quiet turtlebot-dashboard-base.service && BASE_SERVICE="active" || BASE_SERVICE="inactive"
+  NODES="$(timeout -k 1 5 ros2 node list 2>/dev/null || true)"
+  printf '%s\n' "$NODES" | grep -Eq '(^|/)turtlebot3_node$' && TURTLEBOT_NODE="present"
+  ODOM_INFO="$(timeout -k 1 5 ros2 topic info {odom_topic} -v 2>/dev/null || true)"
+  CMD_INFO="$(timeout -k 1 5 ros2 topic info {cmd_vel_topic} -v 2>/dev/null || true)"
+  ODOM_PUBLISHERS="$(printf '%s\n' "$ODOM_INFO" | sed -n 's/^Publisher count: *//p' | head -1)"
+  CMD_VEL_SUBSCRIBERS="$(printf '%s\n' "$CMD_INFO" | sed -n 's/^Subscription count: *//p' | head -1)"
+fi
+[[ "$ODOM_PUBLISHERS" =~ ^[0-9]+$ ]] || ODOM_PUBLISHERS=0
+[[ "$CMD_VEL_SUBSCRIBERS" =~ ^[0-9]+$ ]] || CMD_VEL_SUBSCRIBERS=0
+READY="false"
+if [ "$OPENCR_STATE" = "verified" ] && [ "$TURTLEBOT_NODE" = "present" ] && [ "$ODOM_PUBLISHERS" -gt 0 ] && [ "$CMD_VEL_SUBSCRIBERS" -gt 0 ]; then
+  READY="true"
+fi
+
+echo "DASHBOARD_OPENCR_STATE=$OPENCR_STATE"
+echo "DASHBOARD_OPENCR_PORT=$OPENCR_PORT"
+echo "DASHBOARD_OPENCR_ARDUINO_PORTS=$ARDUINO_PORT"
+echo "DASHBOARD_OPENCR_UNKNOWN_PORTS=$UNKNOWN_PORTS"
+echo "DASHBOARD_OPENCR_ROS_READY=$ROS_READY"
+echo "DASHBOARD_OPENCR_BASE_SERVICE=$BASE_SERVICE"
+echo "DASHBOARD_OPENCR_NODE=$TURTLEBOT_NODE"
+echo "DASHBOARD_OPENCR_ODOM_PUBLISHERS=$ODOM_PUBLISHERS"
+echo "DASHBOARD_OPENCR_CMD_VEL_SUBSCRIBERS=$CMD_VEL_SUBSCRIBERS"
+echo "DASHBOARD_OPENCR_READY=$READY"
+echo "DASHBOARD_OPENCR_DETAIL=$OPENCR_DETAIL"
+"""
+
+
+def parse_robot_hardware_check_output(output: Any) -> Dict[str, Any]:
+    text = str(output or "")
+
+    def marker(name: str, default: str = "") -> str:
+        match = re.search(rf"^DASHBOARD_OPENCR_{name}=(.*)$", text, re.MULTILINE)
+        return match.group(1).strip() if match else default
+
+    def marker_int(name: str) -> int:
+        try:
+            return max(0, int(marker(name, "0")))
+        except (TypeError, ValueError):
+            return 0
+
+    state = marker("STATE", "unknown")
+    connected = state == "verified"
+    ready = marker("READY").lower() == "true"
+    return {
+        "state": state,
+        "connected": connected,
+        "ready": ready,
+        "port": marker("PORT") or None,
+        "arduinoPorts": [value for value in marker("ARDUINO_PORTS").split(",") if value],
+        "unknownPorts": [value for value in marker("UNKNOWN_PORTS").split(",") if value],
+        "rosReady": marker("ROS_READY") == "1",
+        "baseService": marker("BASE_SERVICE", "unknown"),
+        "turtlebotNode": marker("NODE", "missing") == "present",
+        "odomPublishers": marker_int("ODOM_PUBLISHERS"),
+        "cmdVelSubscribers": marker_int("CMD_VEL_SUBSCRIBERS"),
+        "detail": marker("DETAIL", "OpenCR status markers were not returned."),
+        "checkedAt": now_iso(),
+    }
 
 
 def run_ssh_script(network: Dict[str, Any], script: str, timeout: float = 70.0) -> Dict[str, Any]:
@@ -3498,6 +3641,42 @@ def run_robot_ssh_check_from_state(state: "DashboardState", detailed: bool = Fal
         "robotLabel": profile.get("label") or robot_id,
         "detailed": detailed,
         "startedAt": started_at,
+        "command": result.get("command"),
+        "returncode": result.get("returncode"),
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
+    }
+
+
+def run_robot_hardware_check_from_state(state: "DashboardState") -> Dict[str, Any]:
+    setup = state.get_setup()
+    robot_id, profile = active_robot_profile(setup)
+    network = active_robot_network(setup)
+    topics = profile.get("topics") if isinstance(profile.get("topics"), dict) else setup.get("topics", {})
+    started_at = now_iso()
+    result = run_ssh_script(
+        network,
+        build_robot_hardware_check_script(network, topics),
+        timeout=35.0,
+    )
+    hardware = parse_robot_hardware_check_output(result.get("stdout"))
+    if not result.get("ok"):
+        hardware.update(
+            {
+                "state": "ssh_error",
+                "connected": False,
+                "ready": False,
+                "detail": result.get("stderr") or "Could not run the OpenCR check over SSH.",
+                "checkedAt": started_at,
+            }
+        )
+    state.update_runtime({"opencr": hardware, "lastOpencrCheckAt": started_at})
+    return {
+        "ok": bool(result.get("ok")),
+        "robotId": robot_id,
+        "robotLabel": profile.get("label") or robot_id,
+        "startedAt": started_at,
+        "hardware": hardware,
         "command": result.get("command"),
         "returncode": result.get("returncode"),
         "stdout": result.get("stdout", ""),
@@ -9198,6 +9377,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/robot_ssh_check":
                 self._json(self.context.ros.robot_ssh_check(detailed=bool(body.get("detailed", False))))
+                return
+            if parsed.path == "/api/robot_hardware_check":
+                self._json(run_robot_hardware_check_from_state(self.context.state))
                 return
             if parsed.path == "/api/manual_drive":
                 linear = float(body.get("linear", 0.0))

@@ -12,6 +12,8 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 
 프로필을 선택하면 그 로봇만 제어 대상이 됩니다. `선택 로봇 브링업`과 `선택 로봇 종료`는 선택한 프로필의 SSH와 Domain으로만 동작합니다. 다른 프로필은 Domain별 ROS worker가 pose를 구독하여 지도상의 회피 장애물로 반영하며, pose를 아직 받지 못한 경우에는 수동 위치값을 사용합니다.
 
+`OpenCR 확인`은 로봇 SSH에서 OpenCR의 정상 CDC 식별자(STM32 `0483:5740`)를 확인하고, Arduino/알 수 없는 ACM 장치는 거부합니다. 이어 `turtlebot3_node`, `/odom` publisher, `/cmd_vel` subscriber까지 검사해 단순 USB 연결과 실제 TurtleBot base 준비 상태를 구분합니다.
+
 ## 화면
 
 ### 셋업 대시보드
