@@ -22,7 +22,7 @@ TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지
 
 셋업의 변경은 상단 `저장·적용` 버튼 하나로 저장됩니다. 선택 로봇의 IP·SSH·ROS Domain·토픽도 함께 반영되며, 초기 위치를 바꾼 경우에는 같은 동작으로 `/initialpose` 전송까지 수행합니다. 저장 결과가 입력한 로봇 연결값과 다르면 화면의 변경사항을 유지하고 오류로 표시합니다.
 
-![TurtleBot Dashboard setup save and apply](docs/images/dashboard-setup-save-apply.svg)
+![TurtleBot Dashboard setup save and apply](docs/images/dashboard-setup-save-apply.jpg)
 
 ### 주행 대시보드
 
