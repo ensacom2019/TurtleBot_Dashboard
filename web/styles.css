@@ -804,7 +804,30 @@ canvas {
 
 .button-row {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
+}
+
+.soft-waypoint-adjust-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.soft-waypoint-adjust-option input {
+  accent-color: var(--accent-2);
+}
+
+.route-adjustment-notice {
+  margin: 10px 2px 0;
+  color: #d8dde2;
+  font-size: 12px;
 }
 
 .route-tools {

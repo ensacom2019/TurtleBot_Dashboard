@@ -37,7 +37,7 @@ const state = {
   },
 };
 
-const ASTAR_SOFT_CELL_MULTIPLIER = 12;
+const ASTAR_SOFT_CELL_MULTIPLIER = 4;
 
 const DEFAULT_ROBOT_PROFILES = {
   tb3_2: {
@@ -211,6 +211,8 @@ function bindElements() {
     "sendGoalButton",
     "resumeRouteButton",
     "routeResumeStatus",
+    "autoAdjustSoftWaypoint",
+    "routeAdjustmentNotice",
     "cancelGoalButton",
     "stopButton",
     "statusMode",
@@ -279,6 +281,12 @@ function bindActions() {
   });
   els.activeRobotProfile.addEventListener("change", () => applyRobotProfile(els.activeRobotProfile.value));
   els.manualStopButton.addEventListener("click", () => stopManualDrive({ force: true }));
+  els.autoAdjustSoftWaypoint.addEventListener("change", () => {
+    const message = checkboxValue(els.autoAdjustSoftWaypoint)
+      ? "노란 영역의 새 경유지와 최종 목표를 흰색 셀로 자동 보정합니다."
+      : "노란 영역 자동 보정을 끕니다. 새 지점은 입력한 위치를 유지합니다.";
+    setRouteAdjustmentNotice(message);
+  });
   els.cancelGoalButton.addEventListener("click", () => postJson("/api/cancel", {}).then(showResult));
   els.stopButton.addEventListener("click", stopAllMotion);
   els.cameraToggleButton.addEventListener("click", toggleCamera);
@@ -435,6 +443,7 @@ function onDrivePointerUp(event) {
   } catch (_error) {
     // The pointer may already have been released by the browser.
   }
+  adjustSelectedGoalForSoftArea();
 }
 
 function setSelectedGoal(x, y, yaw) {
@@ -444,6 +453,82 @@ function setSelectedGoal(x, y, yaw) {
   setNumber(els.goalYaw, normalized);
   setNumber(els.goalYawRange, normalized);
   state.selectedGoal = { x: Number(x), y: Number(y), yaw: normalized };
+  planPathToGoal();
+  renderWaypoints();
+}
+
+function setRouteAdjustmentNotice(message = "") {
+  if (!els.routeAdjustmentNotice) return;
+  els.routeAdjustmentNotice.textContent = message;
+  els.routeAdjustmentNotice.hidden = !message;
+}
+
+function targetPointText(target) {
+  return `(${round(Number(target.x))}, ${round(Number(target.y))})`;
+}
+
+function nearestWhiteCell(start, metrics, blocked, soft) {
+  let nearest = null;
+  for (let y = 0; y < metrics.rows; y += 1) {
+    for (let x = 0; x < metrics.cols; x += 1) {
+      const key = cellKey(x, y);
+      if (blocked.has(key) || soft.has(key)) continue;
+      const distanceSquared = (x - start.x) ** 2 + (y - start.y) ** 2;
+      if (!nearest || distanceSquared < nearest.distanceSquared) {
+        nearest = { x, y, distanceSquared };
+      }
+    }
+  }
+  return nearest;
+}
+
+function adjustSoftRouteTarget(target, label) {
+  const { adjustedFrom, softUnadjusted, ...cleanTarget } = target;
+  if (!checkboxValue(els.autoAdjustSoftWaypoint)) return cleanTarget;
+
+  const setup = currentSetup();
+  const cell = worldToGrid(cleanTarget, setup);
+  if (!cell) return cleanTarget;
+  const baseClearance = configuredClearanceDistance(setup);
+  const displayedHard = inflatedCellSetForExtents(setup, { x: baseClearance, y: baseClearance });
+  const displayedSoft = inflatedCellSetForExtents(setup, {
+    x: baseClearance + Math.max(0, Number(setup.fallbackNavigation?.softDistance) || 0),
+    y: baseClearance + Math.max(0, Number(setup.fallbackNavigation?.softDistance) || 0),
+  });
+  const blocked = inflatedCellSet(setup);
+  const key = cellKey(cell.x, cell.y);
+  // Match the red/yellow overlay: red cells stay rejected, and only a visible yellow cell is corrected.
+  if (displayedHard.has(key) || !displayedSoft.has(key)) return cleanTarget;
+
+  // The yellow overlay is only a cost/clearance zone: stop at its nearest outer white cell.
+  // Actual red collision cells remain excluded by `blocked`.
+  const whiteCell = nearestWhiteCell(cell, mapMetrics(setup), blocked, displayedSoft);
+  if (!whiteCell) {
+    const unchanged = { ...cleanTarget, softUnadjusted: true };
+    const message = `${label}: 흰색 셀을 찾지 못해 ${targetPointText(cleanTarget)}에 회색 지점으로 유지합니다.`;
+    setRouteAdjustmentNotice(message);
+    toast(message);
+    return unchanged;
+  }
+
+  const adjusted = {
+    ...cleanTarget,
+    ...gridToWorld(whiteCell, setup),
+    adjustedFrom: { x: Number(cleanTarget.x), y: Number(cleanTarget.y) },
+  };
+  const message = `${label}: ${targetPointText(cleanTarget)} → ${targetPointText(adjusted)} (가장 가까운 흰색 셀)`;
+  setRouteAdjustmentNotice(message);
+  toast(message);
+  return adjusted;
+}
+
+function adjustSelectedGoalForSoftArea() {
+  if (!state.selectedGoal) return;
+  const label = `최종 목표 #${state.waypoints.length + 1}`;
+  const adjusted = adjustSoftRouteTarget(state.selectedGoal, label);
+  state.selectedGoal = adjusted;
+  setNumber(els.goalX, adjusted.x);
+  setNumber(els.goalY, adjusted.y);
   planPathToGoal();
   renderWaypoints();
 }
@@ -1738,6 +1823,7 @@ async function sendGoal() {
     forceFallback: checkboxValue(els.forceLidarFallback),
   };
   state.selectedGoal = payload;
+  adjustSelectedGoalForSoftArea();
   const repeat = repeatRouteConfig(state.waypoints.length + 1);
   if (repeat.enabled && !repeat.ok) {
     toast(repeat.error);
@@ -1787,7 +1873,13 @@ async function sendGoal() {
           forceFallback: payload.forceFallback,
           repeat: repeatPayload,
         })
-      : await postJson("/api/goal", { ...payload, path });
+      : await postJson("/api/goal", {
+          ...payload,
+          x: route[route.length - 1].x,
+          y: route[route.length - 1].y,
+          yaw: route[route.length - 1].yaw,
+          path,
+        });
   showResult(result);
 }
 
@@ -1979,11 +2071,13 @@ function setWaypointMode(enabled) {
 }
 
 function addWaypoint(world) {
-  state.waypoints.push({
+  const number = state.waypoints.length + 1;
+  const waypoint = adjustSoftRouteTarget({
     id: `wp-${Date.now()}-${Math.round(Math.random() * 1000)}`,
     x: round(world.x),
     y: round(world.y),
-  });
+  }, `경유지 ${number}`);
+  state.waypoints.push(waypoint);
   renderWaypoints();
   planPathToGoal();
 }
@@ -1996,6 +2090,7 @@ function deleteWaypoint(id) {
 
 function clearWaypoints() {
   state.waypoints = [];
+  setRouteAdjustmentNotice("");
   renderWaypoints();
   planPathToGoal();
 }
@@ -2080,7 +2175,7 @@ function renderWaypoints() {
     .map(
       (waypoint, index) => `
         <div class="waypoint-row">
-          <p>#${index + 1} x ${round(waypoint.x)}, y ${round(waypoint.y)}</p>
+          <p>#${index + 1} x ${round(waypoint.x)}, y ${round(waypoint.y)}${waypoint.softUnadjusted ? " (노란 영역 유지)" : ""}</p>
           <button type="button" data-delete-waypoint="${escapeHtml(waypoint.id)}">삭제</button>
         </div>
       `,
@@ -2090,7 +2185,7 @@ function renderWaypoints() {
   const finalY = optionalNumberValue(els.goalY);
   const finalText = finalX === null || finalY === null
     ? `#${pointCount} 최종 목표 · 미지정`
-    : `#${pointCount} 최종 목표 · x ${round(finalX)}, y ${round(finalY)}, yaw ${round(optionalNumberValue(els.goalYaw) ?? 0)}`;
+    : `#${pointCount} 최종 목표 · x ${round(finalX)}, y ${round(finalY)}, yaw ${round(optionalNumberValue(els.goalYaw) ?? 0)}${state.selectedGoal?.softUnadjusted ? " (노란 영역 유지)" : ""}`;
   els.waypointList.innerHTML = `${
     waypointRows || `<div class="waypoint-row"><p>경유지 없음</p></div>`
   }<div class="waypoint-row final-point"><p>${finalText}</p></div>`;
@@ -4051,12 +4146,17 @@ function drawPlanningOverlay(ctx, canvas, setup, mode) {
   const occupied = blockedCellSet(setup);
   const dynamicOccupied = dynamicLidarObstacleCellKeys(setup);
   const staticOccupied = new Set(Array.from(occupied).filter((key) => !dynamicOccupied.has(key)));
-  const hardInflated = displayedHardInflatedCellSet(setup);
-  const softInflated = displayedSoftInflatedCellSet(setup);
+  const baseClearance = configuredClearanceDistance(setup);
+  const softDistance = Math.max(0, Number(setup.fallbackNavigation?.softDistance) || 0);
+  const baseHardInflated = inflatedCellSetForExtents(setup, { x: baseClearance, y: baseClearance });
+  const baseSoftInflated = inflatedCellSetForExtents(setup, {
+    x: baseClearance + softDistance,
+    y: baseClearance + softDistance,
+  });
   const free = new Set(normalizeBlockedCells(setup.planner?.freeCells || []));
   if (setup.planner?.showInflation) {
-    const hardOnly = new Set(Array.from(hardInflated).filter((key) => !occupied.has(key)));
-    const softOnly = new Set(Array.from(softInflated).filter((key) => !hardInflated.has(key)));
+    const hardOnly = new Set(Array.from(baseHardInflated).filter((key) => !occupied.has(key)));
+    const softOnly = new Set(Array.from(baseSoftInflated).filter((key) => !baseHardInflated.has(key)));
     drawCellSet(ctx, canvas, setup, softOnly, "rgba(232, 184, 95, 0.18)", 12000);
     drawCellSet(ctx, canvas, setup, hardOnly, "rgba(223, 98, 98, 0.22)", 12000);
   }
@@ -4404,7 +4504,7 @@ function drawWaypointMarkers(ctx, canvas) {
     if (!point) return;
     const radius = 10 * (window.devicePixelRatio || 1);
     ctx.save();
-    ctx.fillStyle = "#e8b85f";
+    ctx.fillStyle = waypoint.softUnadjusted ? "#8c969d" : "#e8b85f";
     ctx.strokeStyle = "#07130c";
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -4425,8 +4525,8 @@ function drawGoal(ctx, canvas, goal) {
   if (!point) return;
   ctx.save();
   ctx.translate(point.x, point.y);
-  ctx.strokeStyle = "#5aa6d6";
-  ctx.fillStyle = "#5aa6d6";
+  ctx.strokeStyle = goal.softUnadjusted ? "#8c969d" : "#5aa6d6";
+  ctx.fillStyle = goal.softUnadjusted ? "#8c969d" : "#5aa6d6";
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.arc(0, 0, 12, 0, Math.PI * 2);

@@ -4,7 +4,7 @@
 
 A web dashboard for operating TurtleBot3 Burger robots with ROS 2 Jazzy. It brings map setup, A* path planning, LiDAR-based fallback navigation, manual driving, camera monitoring, multi-robot profiles, and SSH bringup into one interface.
 
-The documented dashboard version is `2026-07-22.89`.
+The documented dashboard version is `2026-07-22.96`.
 
 ## Multi-Robot Support
 
@@ -142,6 +142,8 @@ In Jazzy, the bridge uses dedicated ROS contexts and executors to process LiDAR,
 5. When a LiDAR point is within the configured clearance of the robot footprint, the controller seeks a safer direction before continuing. The configured slowdown zone uses a fixed reduced speed.
 
 The pink prohibited zone shown on the map is a visual safety buffer. Actual A* collision checks separately include the robot body, attachment envelope, and safety clearances. Inflation zones cost more during planning, so clear space is preferred whenever a valid route exists.
+
+The **Auto-adjust yellow waypoints** option above the Drive map is enabled by default. A newly placed waypoint or final goal in a yellow inflation cell moves to the nearest white cell just outside that clearance zone and briefly shows its before/after coordinates. If no white cell exists, the point stays at the yellow location and is drawn gray. A red prohibited cell is still rejected without adjustment.
 
 Waypoints that are blocked or unreachable are skipped one at a time and the next waypoint is checked. The final goal is never silently skipped: if it is unreachable, the drive does not start.
 

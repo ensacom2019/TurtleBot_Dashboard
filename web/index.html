@@ -77,7 +77,7 @@
               </label>
               <label class="check-row">
                 <input id="showInflation" type="checkbox" />
-                Inflation 표시
+                셋업 금지 영역 표시
               </label>
               <label class="check-row">
                 <input id="showLidarPoints" type="checkbox" />
@@ -477,6 +477,10 @@
             <div class="panel-head">
               <h2>맵</h2>
               <div class="button-row">
+                <label class="soft-waypoint-adjust-option" title="노란 완충 영역의 지점을 가장 가까운 흰색 셀로 옮깁니다.">
+                  <input id="autoAdjustSoftWaypoint" type="checkbox" checked />
+                  <span>노란 경유지 자동 보정</span>
+                </label>
                 <button id="cancelGoalButton">취소</button>
                 <button id="stopButton" class="danger">정지</button>
               </div>
@@ -484,6 +488,7 @@
             <div class="map-shell">
               <canvas id="driveMapCanvas" width="1100" height="760"></canvas>
             </div>
+            <p id="routeAdjustmentNotice" class="route-adjustment-notice" hidden></p>
           </section>
 
           <aside class="panel status-panel">
