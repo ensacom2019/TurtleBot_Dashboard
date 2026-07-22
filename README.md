@@ -4,7 +4,7 @@
 
 TurtleBot3 Burger와 ROS 2 Jazzy를 위한 로컬 웹 대시보드입니다. 지도 설정, A* 경로 계획, LiDAR 기반 비상 주행, 수동 운전, 카메라 확인, 로봇 SSH 브링업을 한 화면에서 다룹니다.
 
-현재 문서 기준 버전은 `2026-07-21.85`입니다.
+현재 문서 기준 버전은 `2026-07-22.89`입니다.
 
 ## 다중 로봇 (서로 다른 ROS Domain)
 
@@ -211,6 +211,8 @@ sudo loginctl enable-linger kim
 ```
 
 `브링업 종료`는 먼저 정지 명령을 보내고 Nav2 lifecycle manager에 shutdown을 요청합니다. 이어 dashboard가 만든 Nav2·카메라 tmux 세션에 `Ctrl+C`를 보내 최대 12초간 정상 종료를 기다립니다. base는 `systemctl --user stop turtlebot-dashboard-base.service`로 service cgroup 전체에 `SIGINT`를 전달하므로 LiDAR 자식 프로세스도 `Ctrl+C`와 같은 순서로 종료됩니다. 시간 안에 끝나지 않은 dashboard tmux/nohup 세션만 제한적으로 강제 종료하며, 수동으로 실행한 ROS 프로세스는 종료하지 않고 검증 실패로 표시합니다.
+
+`브링업 종료`를 누르면 대시보드가 설치된 폴더의 최상단 `stop_all.sh`를 먼저 확인합니다. 없으면 YOLO·카메라 뷰어·순찰·도킹 헬퍼를 SIGINT 우선으로 종료하는 기본 스크립트를 자동 생성합니다. 실행할 때 선택 로봇에 적용된 `/cmd_vel`, `/cmd_vel_nav`, `/scan`, `/odom`, Raw/Compressed 카메라와 Nav2 lifecycle manager 경로를 스크립트의 관리 설정 블록에 저장합니다. 실제 TurtleBot3 base·LiDAR·카메라 종료는 사용자 제작 wrapper를 찾지 않고 ROBOTIS 공식 bringup 구성에 맞춰 SSH에서 Nav2 lifecycle, Ctrl+C, systemd SIGINT 순서로 처리하고 토픽·프로세스를 검증합니다. 사용자가 만든 `stop_all.sh`에는 관리 블록이 없으면 덮어쓰지 않고 그대로 실행합니다.
 
 직접 SSH 터미널에서 실행한 기존 `ros2 launch`는 대시보드가 소유하지 않으므로 자동 종료하지 않습니다. 한 번 `Ctrl+C`로 종료한 뒤 대시보드 브링업으로 전환하세요.
 

@@ -4,7 +4,7 @@
 
 A web dashboard for operating TurtleBot3 Burger robots with ROS 2 Jazzy. It brings map setup, A* path planning, LiDAR-based fallback navigation, manual driving, camera monitoring, multi-robot profiles, and SSH bringup into one interface.
 
-The documented dashboard version is `2026-07-16.83`.
+The documented dashboard version is `2026-07-22.89`.
 
 ## Multi-Robot Support
 
@@ -187,6 +187,8 @@ sudo loginctl enable-linger kim
 ```
 
 **Robot Bringup Stop** first publishes a stop command and requests Nav2 lifecycle shutdown. It then sends `Ctrl+C` to dashboard-owned Nav2 and camera tmux sessions, waits for graceful shutdown, and stops the base systemd user service so its LiDAR child process receives `SIGINT`. Processes started manually in a separate terminal are not owned by the dashboard and must be stopped from that terminal with `Ctrl+C` before using dashboard bringup.
+
+When **Robot Bringup Stop** is pressed, the dashboard first looks for the top-level `stop_all.sh` beside the dashboard files. The managed default stores the selected `/cmd_vel`, `/cmd_vel_nav`, `/scan`, `/odom`, camera, and Nav2 lifecycle-manager paths in its config block. It does not rely on a user-made `robot_bringup_all.sh`; the official TurtleBot3 base, LiDAR, and camera bringup are stopped over SSH through Nav2 lifecycle, Ctrl+C, and systemd SIGINT, followed by verification. A user-owned `stop_all.sh` without the managed block is not overwritten.
 
 ## Verification
 

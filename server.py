@@ -37,7 +37,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-21.85"
+APP_VERSION = "2026-07-22.89"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -3418,7 +3418,10 @@ def _run_robot_bringup_from_state(
 def build_robot_bringup_stop_script(network: Dict[str, Any], topics: Dict[str, Any]) -> str:
     domain = shlex.quote(str(network.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or "1"))
     localhost_only = shlex.quote(str(network.get("rosLocalhostOnly") or "0"))
-    cmd_vel = shlex.quote(str(topics.get("cmdVel") or "/cmd_vel"))
+    cmd_vel_topic = str(topics.get("cmdVel") or "/cmd_vel").strip() or "/cmd_vel"
+    cmd_vel = shlex.quote(cmd_vel_topic)
+    cmd_vel_namespace = namespace_from_topic(cmd_vel_topic, "/cmd_vel") or ""
+    cmd_vel_nav = shlex.quote(namespace_topic(cmd_vel_namespace, "/cmd_vel_nav"))
     scan = shlex.quote(str(topics.get("scan") or "/scan"))
     camera = shlex.quote(str(topics.get("camera") or "/camera/image_raw"))
     compressed_camera = shlex.quote(
@@ -3443,10 +3446,18 @@ BASE_SERVICE="turtlebot-dashboard-base.service"
 LOG_DIR="$HOME/turtlebot_dashboard_logs"
 NAVIGATION_MANAGER={navigation_manager}
 LOCALIZATION_MANAGER={localization_manager}
+CMD_VEL={cmd_vel}
+CMD_VEL_NAV={cmd_vel_nav}
 USER_UID="$(id -u)"
 export XDG_RUNTIME_DIR="/run/user/$USER_UID"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 remaining=0
+
+publish_zero_velocity() {{
+  local topic="$1"
+  timeout -k 1 3 ros2 topic pub --once "$topic" geometry_msgs/msg/Twist "{{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}" >/dev/null 2>&1 || true
+  timeout -k 1 3 ros2 topic pub --once "$topic" geometry_msgs/msg/TwistStamped "{{twist: {{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}}}" >/dev/null 2>&1 || true
+}}
 
 shutdown_nav2_lifecycle_manager() {{
   local manager="$1"
@@ -3521,8 +3532,8 @@ stop_dashboard_nohup_process() {{
 }}
 
 echo "== dashboard robot bringup stop =="
-timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/Twist "{{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}" >/dev/null 2>&1 || true
-timeout -k 1 3 ros2 topic pub --once {cmd_vel} geometry_msgs/msg/TwistStamped "{{twist: {{linear: {{x: 0.0}}, angular: {{z: 0.0}}}}}}" >/dev/null 2>&1 || true
+publish_zero_velocity "$CMD_VEL"
+publish_zero_velocity "$CMD_VEL_NAV"
 
 # Nav2 needs its lifecycle state machine to shut down before the launch process exits.
 shutdown_nav2_lifecycle_manager "$NAVIGATION_MANAGER" || true
@@ -3613,6 +3624,195 @@ echo "[OK] dashboard bringup stopped and verified"
 """
 
 
+def dashboard_host_stop_script_template() -> str:
+    """Return the safe fallback script stored at the dashboard repository top level."""
+    return """#!/usr/bin/env bash
+# TurtleBot Dashboard host-side shutdown helper.
+# It is generated only when this repository has no top-level stop_all.sh.
+set +e
+
+# DASHBOARD_MANAGED_CONFIG_BEGIN
+DASHBOARD_CMD_VEL=/cmd_vel
+DASHBOARD_CMD_VEL_NAV=/cmd_vel_nav
+DASHBOARD_SCAN=/scan
+DASHBOARD_ODOM=/odom
+DASHBOARD_CAMERA=/camera/image_raw
+DASHBOARD_COMPRESSED_CAMERA=/camera/image_raw/compressed
+DASHBOARD_NAVIGATION_MANAGER=/lifecycle_manager_navigation
+DASHBOARD_LOCALIZATION_MANAGER=/lifecycle_manager_localization
+# DASHBOARD_MANAGED_CONFIG_END
+
+source /opt/ros/jazzy/setup.bash 2>/dev/null || true
+[ -f "$HOME/turtlebot3_ws/install/setup.bash" ] && source "$HOME/turtlebot3_ws/install/setup.bash"
+export ROS2CLI_NO_DAEMON=1
+CMD_VEL="${DASHBOARD_CMD_VEL:-/cmd_vel}"
+CMD_VEL_NAV="${DASHBOARD_CMD_VEL_NAV:-/cmd_vel_nav}"
+
+publish_zero_velocity() {
+  local topic="$1"
+  command -v ros2 >/dev/null 2>&1 || return 0
+  timeout -k 1 3 ros2 topic pub --once "$topic" geometry_msgs/msg/Twist \
+    "{linear: {x: 0.0}, angular: {z: 0.0}}" >/dev/null 2>&1 || true
+  timeout -k 1 3 ros2 topic pub --once "$topic" geometry_msgs/msg/TwistStamped \
+    "{twist: {linear: {x: 0.0}, angular: {z: 0.0}}}" >/dev/null 2>&1 || true
+}
+
+stop_helper() {
+  local pattern="$1"
+  pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+  echo "[STOP] host helper: $pattern"
+  pkill -INT -f "$pattern" >/dev/null 2>&1 || true
+  sleep 1
+  pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+  pkill -TERM -f "$pattern" >/dev/null 2>&1 || true
+}
+
+echo "== dashboard host stop_all.sh =="
+echo "[INFO] saved cmd_vel: $CMD_VEL"
+echo "[INFO] saved cmd_vel_nav: $CMD_VEL_NAV"
+echo "[INFO] official TurtleBot3 topics: scan=$DASHBOARD_SCAN odom=$DASHBOARD_ODOM camera=$DASHBOARD_CAMERA"
+echo "[INFO] Nav2 lifecycle: $DASHBOARD_NAVIGATION_MANAGER, $DASHBOARD_LOCALIZATION_MANAGER"
+publish_zero_velocity "$CMD_VEL"
+publish_zero_velocity "$CMD_VEL_NAV"
+for pattern in \
+  'robot_yolo_viewer.py' \
+  'view_yolo' \
+  'view_geng_camera' \
+  'rqt_image_view' \
+  'webcam_yolo_preview' \
+  'webcam_aihub_yolov5' \
+  'launch_robot_test.sh' \
+  'run_patrol.py' \
+  'run_patrol_continuous.py' \
+  'run_patrol.sh' \
+  'park_.*\\.py' \
+  'aruco_align_.*\\.py' \
+  'rotate_t1_precise.py' \
+  'rotate_map_yaw.py' \
+  'dock_.*' \
+  'go_nav2.sh' \
+  'go_nav2_geng_rpp' \
+  'nav2_rviz.sh' \
+  'start_geng_camera'; do
+  stop_helper "$pattern"
+done
+echo "[OK] dashboard host helper stop completed"
+"""
+
+
+def dashboard_host_stop_script_config(network: Dict[str, Any], topics: Dict[str, Any]) -> str:
+    """Render the persistent topic values consumed by the managed host script."""
+    cmd_vel_topic = str(topics.get("cmdVel") or "/cmd_vel").strip() or "/cmd_vel"
+    cmd_vel_namespace = namespace_from_topic(cmd_vel_topic, "/cmd_vel") or ""
+    goal_action = str(topics.get("goalAction") or "/navigate_to_pose").strip() or "/navigate_to_pose"
+    nav_namespace = namespace_from_topic(goal_action, "/navigate_to_pose") or ""
+    return "\n".join(
+        (
+            "# DASHBOARD_MANAGED_CONFIG_BEGIN",
+            f"DASHBOARD_CMD_VEL={shlex.quote(cmd_vel_topic)}",
+            f"DASHBOARD_CMD_VEL_NAV={shlex.quote(namespace_topic(cmd_vel_namespace, '/cmd_vel_nav'))}",
+            f"DASHBOARD_SCAN={shlex.quote(str(topics.get('scan') or '/scan'))}",
+            f"DASHBOARD_ODOM={shlex.quote(str(topics.get('odom') or '/odom'))}",
+            f"DASHBOARD_CAMERA={shlex.quote(str(topics.get('camera') or '/camera/image_raw'))}",
+            f"DASHBOARD_COMPRESSED_CAMERA={shlex.quote(str(topics.get('compressedCamera') or '/camera/image_raw/compressed'))}",
+            f"DASHBOARD_NAVIGATION_MANAGER={shlex.quote(namespace_topic(nav_namespace, '/lifecycle_manager_navigation'))}",
+            f"DASHBOARD_LOCALIZATION_MANAGER={shlex.quote(namespace_topic(nav_namespace, '/lifecycle_manager_localization'))}",
+            "# DASHBOARD_MANAGED_CONFIG_END",
+        )
+    )
+
+
+def update_dashboard_host_stop_script_config(
+    script_path: Path, network: Dict[str, Any], topics: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Update only the marked config block; never rewrite a user-owned script."""
+    try:
+        source = script_path.read_text(encoding="utf-8")
+        block = dashboard_host_stop_script_config(network, topics)
+        matcher = re.compile(
+            r"(?ms)^# DASHBOARD_MANAGED_CONFIG_BEGIN\r?\n.*?^# DASHBOARD_MANAGED_CONFIG_END$"
+        )
+        if not matcher.search(source):
+            return {
+                "ok": True,
+                "managed": False,
+                "warning": "Existing stop_all.sh has no dashboard config block; keeping it unchanged.",
+            }
+        script_path.write_text(matcher.sub(block, source, count=1), encoding="utf-8")
+        return {"ok": True, "managed": True}
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not save stop_all.sh settings: {exc}"}
+
+
+def ensure_dashboard_host_stop_script(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Find or create the editable top-level host stop script."""
+    script_path = path or (ROOT / "stop_all.sh")
+    try:
+        if script_path.exists():
+            if not script_path.is_file():
+                return {"ok": False, "path": str(script_path), "error": "stop_all.sh is not a file."}
+            return {"ok": True, "path": str(script_path), "created": False}
+        script_path.write_text(dashboard_host_stop_script_template(), encoding="utf-8")
+        try:
+            script_path.chmod(script_path.stat().st_mode | 0o100)
+        except OSError:
+            pass
+        return {"ok": True, "path": str(script_path), "created": True}
+    except OSError as exc:
+        return {"ok": False, "path": str(script_path), "error": f"Could not create stop_all.sh: {exc}"}
+
+
+def run_dashboard_host_stop_script(network: Dict[str, Any], topics: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the repository-top-level helper before the robot SSH shutdown."""
+    script_info = ensure_dashboard_host_stop_script()
+    if not script_info.get("ok"):
+        return {"ok": False, "stderr": str(script_info.get("error") or "stop_all.sh is unavailable.")}
+    config_result = update_dashboard_host_stop_script_config(Path(script_info["path"]), network, topics)
+    if not config_result.get("ok"):
+        return {"ok": False, "stderr": str(config_result.get("error") or "Could not configure stop_all.sh.")}
+    if os.name != "posix":
+        return {
+            "ok": True,
+            "warning": f"Host stop script is ready at {script_info['path']}, but this Windows dashboard host cannot run Bash; continuing with robot SSH shutdown.",
+        }
+    bash_path = shutil.which("bash")
+    if not bash_path:
+        return {
+            "ok": True,
+            "warning": f"Host stop script is ready at {script_info['path']}, but Bash is unavailable; continuing with robot SSH shutdown.",
+        }
+    environment = {
+        **os.environ,
+        "ROS_DOMAIN_ID": str(network.get("rosDomainId") or os.environ.get("ROS_DOMAIN_ID") or "1"),
+        "ROS_LOCALHOST_ONLY": str(network.get("rosLocalhostOnly") or "0"),
+        "DASHBOARD_CMD_VEL": str(topics.get("cmdVel") or "/cmd_vel").strip() or "/cmd_vel",
+        "DASHBOARD_CMD_VEL_NAV": namespace_topic(
+            namespace_from_topic(str(topics.get("cmdVel") or "/cmd_vel").strip() or "/cmd_vel", "/cmd_vel") or "",
+            "/cmd_vel_nav",
+        ),
+    }
+    try:
+        completed = subprocess.run(
+            [bash_path, str(script_info["path"])],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=75.0,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "stderr": "Host stop_all.sh timed out after 75 seconds."}
+    result = {
+        "ok": completed.returncode == 0,
+        "stdout": (completed.stdout or "").strip(),
+        "stderr": (completed.stderr or "").strip(),
+    }
+    if config_result.get("warning"):
+        result["warning"] = config_result["warning"]
+    return result
+
+
 def run_robot_bringup_stop_from_state(state: "DashboardState") -> Dict[str, Any]:
     setup = state.get_setup()
     robot_id, profile = active_robot_profile(setup)
@@ -3639,11 +3839,19 @@ def _run_robot_bringup_stop_from_state(
     network = active_robot_network(setup)
     topics = selected_profile.get("topics") if isinstance(selected_profile.get("topics"), dict) else setup.get("topics", {})
     started_at = now_iso()
+    local_stop = run_dashboard_host_stop_script(network, topics)
     result = run_ssh_script(
         network,
         build_robot_bringup_stop_script(network, topics),
-        timeout=40.0,
+        timeout=120.0,
     )
+    local_stdout = str(local_stop.get("stdout") or "").strip()
+    local_stderr = str(local_stop.get("stderr") or local_stop.get("warning") or "").strip()
+    if local_stdout:
+        result["stdout"] = f"== dashboard host stop_all.sh ==\n{local_stdout}\n\n== robot SSH stop ==\n{result.get('stdout', '')}".strip()
+    if local_stderr:
+        result["stderr"] = f"{local_stderr}\n{result.get('stderr', '')}".strip()
+    result["ok"] = bool(result.get("ok")) and bool(local_stop.get("ok", True))
     state.update_runtime(
         {
             "navStatus": "robot_bringup_stopped" if result.get("ok") else "robot_bringup_stop_failed",

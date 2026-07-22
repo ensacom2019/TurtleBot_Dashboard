@@ -496,6 +496,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn('NAVIGATION_MANAGER=/lifecycle_manager_navigation', script)
         self.assertIn("{command: 4}", script)
         self.assertIn("/tb3_2/cmd_vel", script)
+        self.assertIn("/tb3_2/cmd_vel_nav", script)
         self.assertIn("/tb3_2/scan", script)
         self.assertIn("dashboard bringup stop verification", script)
         self.assertIn("systemd service stopped", script)
@@ -504,6 +505,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn('pkill -f "[r]os2 launch turtlebot3_bringup', script)
         self.assertNotIn('pkill -f "[m]ap_server', script)
         self.assertNotIn('pkill -f "[c]amera_ros', script)
+        self.assertNotIn("pkill -f", script)
         self.assertIn("Nav2 processes still active (not force-killed)", script)
         self.assertIn("Camera processes still active (not force-killed)", script)
         self.assertIn("exit 22", script)
@@ -512,6 +514,47 @@ class ServerHelpersTest(unittest.TestCase):
             syntax_check = subprocess.run(
                 [bash_path, "-n"],
                 input=script.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                syntax_check.returncode,
+                0,
+                syntax_check.stderr.decode("utf-8", errors="replace"),
+            )
+
+    def test_top_level_stop_script_is_created_once_and_is_editable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            script_path = Path(temporary_directory) / "stop_all.sh"
+            created = server.ensure_dashboard_host_stop_script(script_path)
+            self.assertTrue(created["ok"])
+            self.assertTrue(created["created"])
+            self.assertTrue(script_path.is_file())
+            generated = script_path.read_text(encoding="utf-8")
+            self.assertIn("robot_yolo_viewer.py", generated)
+            self.assertIn("DASHBOARD_CMD_VEL_NAV", generated)
+            configured = server.update_dashboard_host_stop_script_config(
+                script_path,
+                {"rosDomainId": "7"},
+                {"cmdVel": "/tb3_7/cmd_vel"},
+            )
+            self.assertTrue(configured["ok"])
+            configured_text = script_path.read_text(encoding="utf-8")
+            self.assertIn("DASHBOARD_CMD_VEL=/tb3_7/cmd_vel", configured_text)
+            self.assertIn("DASHBOARD_CMD_VEL_NAV=/tb3_7/cmd_vel_nav", configured_text)
+            self.assertIn("DASHBOARD_SCAN=/scan", configured_text)
+            self.assertIn("DASHBOARD_CAMERA=/camera/image_raw", configured_text)
+            self.assertIn("DASHBOARD_NAVIGATION_MANAGER=/lifecycle_manager_navigation", configured_text)
+            script_path.write_text("#!/usr/bin/env bash\necho custom\n", encoding="utf-8")
+            existing = server.ensure_dashboard_host_stop_script(script_path)
+            self.assertTrue(existing["ok"])
+            self.assertFalse(existing["created"])
+            self.assertIn("echo custom", script_path.read_text(encoding="utf-8"))
+        bash_path = _bash_executable()
+        if bash_path:
+            syntax_check = subprocess.run(
+                [bash_path, "-n"],
+                input=server.dashboard_host_stop_script_template().encode("utf-8"),
                 capture_output=True,
                 check=False,
             )
