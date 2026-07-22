@@ -4,7 +4,7 @@
 
 A web dashboard for operating TurtleBot3 Burger robots with ROS 2 Jazzy. It brings map setup, A* path planning, LiDAR-based fallback navigation, manual driving, camera monitoring, multi-robot profiles, and SSH bringup into one interface.
 
-The documented dashboard version is `2026-07-22.96`.
+The documented dashboard version is `2026-07-22.97`.
 
 ## Multi-Robot Support
 

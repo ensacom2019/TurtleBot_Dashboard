@@ -37,7 +37,7 @@ MAP_DATA_ROOT = DATA_ROOT / "maps"
 CONFIG_ROOT = ROOT / "config"
 SETTINGS_PATH = CONFIG_ROOT / "dashboard_state.json"
 RUN_LOG_ROOT = ROOT / "run_logs"
-APP_VERSION = "2026-07-22.96"
+APP_VERSION = "2026-07-22.97"
 ROBOT_SSH_OPERATION_LOCK = threading.RLock()
 ROBOT_SSH_OPERATION_LOCKS: Dict[str, threading.Lock] = {}
 FALLBACK_SENSOR_STARTUP_WAIT = 2.5
@@ -731,16 +731,8 @@ def effective_footprint_from_setup(setup: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
-def planning_clearance_extents_from_setup(setup: Dict[str, Any]) -> Tuple[float, float]:
-    """Return the axis-aligned body clearance used by the grid planner.
-
-    Planning used to inflate walls by the body's circumscribed-circle radius.
-    That made visible free cells unavailable even when the rectangular TurtleBot
-    footprint would not contact a wall.  The map editor and the fallback A*
-    planner instead use the actual body dimensions plus configured clearance.
-    Runtime LiDAR collision handling remains orientation-aware.
-    """
-    footprint = effective_footprint_from_setup(setup)
+def configured_clearance_from_setup(setup: Dict[str, Any]) -> float:
+    """Return the user-visible red/yellow clearance around a wall or obstacle."""
     planner = setup.get("planner", {}) or {}
     object_config = setup.get("object", {}) or {}
     try:
@@ -751,7 +743,20 @@ def planning_clearance_extents_from_setup(setup: Dict[str, Any]) -> Tuple[float,
         obstacle_clearance = max(0.0, float(object_config.get("inflation") or 0.0))
     except (TypeError, ValueError):
         obstacle_clearance = 0.0
-    extra = hard_clearance + obstacle_clearance
+    return hard_clearance + obstacle_clearance
+
+
+def planning_clearance_extents_from_setup(setup: Dict[str, Any]) -> Tuple[float, float]:
+    """Return the axis-aligned body clearance used by the grid planner.
+
+    Planning used to inflate walls by the body's circumscribed-circle radius.
+    That made visible free cells unavailable even when the rectangular TurtleBot
+    footprint would not contact a wall.  The map editor and the fallback A*
+    planner instead use the actual body dimensions plus configured clearance.
+    Runtime LiDAR collision handling remains orientation-aware.
+    """
+    footprint = effective_footprint_from_setup(setup)
+    extra = configured_clearance_from_setup(setup)
     return (
         max(float(footprint["front"]), float(footprint["back"])) + extra,
         max(float(footprint["left"]), float(footprint["right"])) + extra,
@@ -2376,12 +2381,16 @@ def fallback_replan_path(
                 blocked.add((grid_x, grid_y))
 
     clearance_x, clearance_y = planning_clearance_extents_from_setup(setup)
+    visible_clearance = configured_clearance_from_setup(setup)
     soft_distance = normalized_fallback_settings(setup)["softDistance"]
     inflated = fallback_inflated_cells_for_extents(
         blocked, clearance_x, clearance_y, metrics
     )
     soft_inflated = fallback_inflated_cells_for_extents(
-        blocked, clearance_x + soft_distance, clearance_y + soft_distance, metrics
+        blocked,
+        visible_clearance + soft_distance,
+        visible_clearance + soft_distance,
+        metrics,
     )
 
     remaining_route = route[max(0, int(route_index)) :]

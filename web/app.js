@@ -2911,19 +2911,11 @@ function inflatedCellSet(setup, extraRadius = 0) {
 }
 
 function softInflatedCellSet(setup) {
-  return inflatedCellSet(setup, setup.fallbackNavigation?.softDistance ?? 0.10);
-}
-
-// Keep the overlay tied to the configured margins while collision planning also
-// accounts for the robot footprint internally.
-function displayedHardInflatedCellSet(setup) {
-  return inflatedCellSetForExtents(setup, plannerClearanceExtents(setup));
-}
-
-function displayedSoftInflatedCellSet(setup) {
+  const baseClearance = configuredClearanceDistance(setup);
+  const softDistance = Math.max(0, Number(setup.fallbackNavigation?.softDistance) || 0);
   return inflatedCellSetForExtents(
     setup,
-    plannerClearanceExtents(setup, setup.fallbackNavigation?.softDistance ?? 0.10),
+    { x: baseClearance + softDistance, y: baseClearance + softDistance },
   );
 }
 
